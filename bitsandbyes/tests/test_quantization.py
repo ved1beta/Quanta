@@ -1,5 +1,11 @@
 import torch
 import pytest
+from bitsandbyes.functional.quantization import (
+    quantize_8bit,
+    dequantize_8bit,
+    quantize_4bit,
+    dequantize_4bit
+)
 from bitsandbyes.backends import (
     quantize_8bit,
     dequantize_8bit,

@@ -1,5 +1,46 @@
 import torch 
 from torch.autograd import Function
+from .base import BaseQuantizer
+from typing import Tuple
+
+class Quantizer(BaseQuantizer):
+    """Quantization operations using the base quantizer."""
+    
+    def quantize_8bit(
+        self,
+        tensor: torch.Tensor,
+        per_channel: bool = False,
+        symmetric: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """8-bit quantization."""
+        self.num_bits = 8
+        self.symmetric = symmetric
+        return self.quantize(tensor, per_channel)
+    
+    def quantize_4bit(
+        self,
+        tensor: torch.Tensor,
+        per_channel: bool = False,
+        symmetric: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """4-bit quantization."""
+        self.num_bits = 4
+        self.symmetric = symmetric
+        return self.quantize(tensor, per_channel)
+
+_quantizer = Quantizer()
+
+def quantize_8bit(tensor, per_channel=False, symmetric=True):
+    return _quantizer.quantize_8bit(tensor, per_channel, symmetric)
+
+def quantize_4bit(tensor, per_channel=False, symmetric=True):
+    return _quantizer.quantize_4bit(tensor, per_channel, symmetric)
+
+def dequantize_8bit(q_tensor, scale, zero_point):
+    return _quantizer.dequantize(q_tensor, scale, zero_point)
+
+def dequantize_4bit(q_tensor, scale, zero_point):
+    return _quantizer.dequantize(q_tensor, scale, zero_point)
 
 def quantize(tensor , num_bits = 8 , symmetric = True):
     min_val = tensor.min().item()
