@@ -36,3 +36,35 @@ class BaseQuantizer:
             zero_point = torch.round(-min_val * scale)
         
         return scale, zero_point
+    
+    def quantize(self , 
+                tensor: torch.Tensor,
+                per_channel: bool = False ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
+        scale , zero_piont = self._compute_scale_zero_point(tensor, per_channel)
+        if self.symmetric: 
+            q_tensor = torch.clamp(
+                torch.round(tensor * scale),
+                -self.max_val, self.max_val
+            ).to(torch.int8)
+            
+            q_tensor = (q_tensor + 2**(self.num_bits-1)).to(torch.uint8)
+        else: 
+            q_tensor = torch.clamp(
+                 torch.round(tensor * scale + zero_piont),
+                0, 2**self.num_bits - 1
+            ).to(torch.uint8)
+
+        return q_tensor , scale , zero_piont
+    
+    def dequantize(self, q_tensor: torch.Tensor, scale : torch.Tensor , zero_piont : torch.Tensor  )-> torch.Tensor:
+
+            if not q_tensor.is_contiguous():
+                q_tensor = q_tensor.contiguous()
+
+            if torch.allclose(zero_piont, torch.zeros_like(zero_piont)):
+                q_tensor = q_tensor.to(torch.int8) - 2**(self.num_bits-1)
+
+            return (q_tensor.float() - zero_piont)/scale
