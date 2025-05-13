@@ -1,19 +1,5 @@
-# Bits-and-Byes Project Roadmap
-
-## Initial Setup and Project Structure
-- [ ] Initialize project repository
-- [ ] Set up project directory structure
-- [ ] Create Python package configuration (pyproject.toml, setup.py)
-- [ ] Set up development environment (conda/virtual env)
-- [ ] Configure CI/CD pipeline with GitHub Actions
-- [ ] Set up documentation framework (Sphinx/MkDocs)
-- [ ] Add license file (MIT)
-- [ ] Create README.md with project overview
-- [ ] Add contribution guidelines
-- [ ] Configure linters and code formatters
-
 ## Core Library Foundation
-- [ ] Implement basic tensor operations
+- [X] Implement basic tensor operations
 - [ ] Create CPU fallback implementations
 - [ ] Design modular architecture for different hardware support
 - [ ] Implement base classes for quantization
