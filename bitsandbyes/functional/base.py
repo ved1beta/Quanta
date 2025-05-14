@@ -1,10 +1,9 @@
 import torch 
-from typing import Tuple , Optional 
+from typing import Tuple, Optional 
 
 
 class BaseQuantizer:
     def __init__(self, num_bits: int = 8, symmetric: bool = True):
-
         self.num_bits = num_bits
         self.symmetric = symmetric
         self.max_val = 2**(num_bits - 1) - 1 if symmetric else 2**num_bits - 1
@@ -33,38 +32,41 @@ class BaseQuantizer:
             zero_point = torch.zeros_like(min_val)
         else:
             scale = (2**self.num_bits - 1) / (max_val - min_val)
-            zero_point = torch.round(-min_val * scale)
+            zero_point = min_val
         
         return scale, zero_point
     
-    def quantize(self , 
+    def quantize(self, 
                 tensor: torch.Tensor,
-                per_channel: bool = False ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                per_channel: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
-        scale , zero_piont = self._compute_scale_zero_point(tensor, per_channel)
-        if self.symmetric: 
+        scale, zero_point = self._compute_scale_zero_point(tensor, per_channel)
+        
+        if self.symmetric:
             q_tensor = torch.clamp(
                 torch.round(tensor * scale),
                 -self.max_val, self.max_val
             ).to(torch.int8)
-            
             q_tensor = (q_tensor + 2**(self.num_bits-1)).to(torch.uint8)
-        else: 
+        else:
             q_tensor = torch.clamp(
-                 torch.round(tensor * scale + zero_piont),
+                torch.round((tensor - zero_point) * scale),
                 0, 2**self.num_bits - 1
             ).to(torch.uint8)
 
-        return q_tensor , scale , zero_piont
+        return q_tensor, scale, zero_point
     
-    def dequantize(self, q_tensor: torch.Tensor, scale : torch.Tensor , zero_piont : torch.Tensor  )-> torch.Tensor:
+    def dequantize(self, 
+                  q_tensor: torch.Tensor, 
+                  scale: torch.Tensor, 
+                  zero_point: torch.Tensor) -> torch.Tensor:
+        if not q_tensor.is_contiguous():
+            q_tensor = q_tensor.contiguous()
 
-            if not q_tensor.is_contiguous():
-                q_tensor = q_tensor.contiguous()
-
-            if torch.allclose(zero_piont, torch.zeros_like(zero_piont)):
-                q_tensor = q_tensor.to(torch.int8) - 2**(self.num_bits-1)
-
-            return (q_tensor.float() - zero_piont)/scale
+        if self.symmetric:
+            q_tensor = q_tensor.to(torch.int8) - 2**(self.num_bits-1)
+            return q_tensor.float() / scale
+        else:
+            return q_tensor.float() / scale + zero_point
