@@ -4,30 +4,18 @@ Quantization and dequantization functions.
 
 import torch
 
-def quantize_8bit(tensor, per_channel=False):
+def quantize_8bit(tensor, quant_type="linear", per_channel=False):
     """
     Quantize a floating-point tensor to 8-bit precision.
     """
-    if per_channel:
-        dim = 0 if tensor.dim() > 1 else None
-        min_val = tensor.min(dim=dim, keepdim=True).values
-        max_val = tensor.max(dim=dim, keepdim=True).values
+    if quant_type == "linear":
+        return quantize_8bit_linear(tensor, per_channel)
+    elif quant_type == "nf8":
+        return quantize_8bit_nf8(tensor)
+    elif quant_type == "fp8":
+        return quantize_8bit_fp8(tensor)
     else:
-        min_val = tensor.min()
-        max_val = tensor.max()
-    
-    # Handle edge case where min_val == max_val
-    if torch.allclose(min_val, max_val):
-        return torch.zeros_like(tensor, dtype=torch.uint8), 1.0, min_val
-    
-    scale = (max_val - min_val) / 255
-    zero_point = min_val
-    
-    # Ensure scale is not zero
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
-    
-    q_tensor = torch.clamp(torch.round((tensor - min_val) / scale), 0, 255).to(torch.uint8)
-    return q_tensor, scale, zero_point
+        raise ValueError(f"Unknown quantization type: {quant_type}")
 
 def dequantize_8bit(q_tensor, scale, zero_point):
     """
@@ -96,3 +84,37 @@ def quantize_4bit_nf4(tensor):
     indices = torch.argmin(distances, dim=-1)
     
     return indices.to(torch.uint8), abs_max, nf4_levels
+
+def quantize_4bit_fp4(tensor):
+    signs = torch.sign(tensor)
+    abs_values = torch.abs(tensor)
+
+    log_values  =torch.log2(abs_values + ( abs_values == 0 ).float())
+    exp_bias = 1 
+    exp_values = torch.clamp(torch.round(log_values + exp_bias), 0, 3)
+    mantissa_values = torch.round((abs_values / (2 ** (exp_values - exp_bias))) - 1)
+    mantissa_values = torch.clamp(mantissa_values, 0, 1)
+
+    q_tensor = ((exp_values << 1) | mantissa_values).to(torch.uint8)
+    q_tensor = torch.where(signs < 0, q_tensor | 0x8, q_tensor)
+    
+    return q_tensor, exp_bias
+
+def quantize_8bit_linear(tensor, per_channel=False):
+    """
+    Linear 8-bit quantization with 256 levels (0-255).
+    """
+    if per_channel:
+        dim = 0 if tensor.dim() > 1 else None
+        min_val = tensor.min(dim=dim, keepdim=True).values
+        max_val = tensor.max(dim=dim, keepdim=True).values
+    else:
+        min_val = tensor.min()
+        max_val = tensor.max()
+    
+    scale = (max_val - min_val) / 255
+    zero_point = min_val
+    
+    q_tensor = torch.clamp(torch.round((tensor - min_val) / scale), 0, 255).to(torch.uint8)
+    return q_tensor, scale, zero_point
+    
