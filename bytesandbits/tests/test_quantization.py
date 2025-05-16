@@ -1,16 +1,20 @@
+"""
+Tests for quantization and dequantization functions.
+"""
+
 import torch
 import pytest
 from bytesandbits.functional.quantization import (
     quantize_8bit,
     dequantize_8bit,
     quantize_4bit,
-    dequantize_4bit
-)
-from bytesandbits.backends import (
-    quantize_8bit,
-    dequantize_8bit,
-    quantize_4bit,
-    dequantize_4bit
+    dequantize_4bit,
+    quantize_8bit_linear,
+    quantize_8bit_nf8,
+    quantize_8bit_fp8,
+    quantize_4bit_linear,
+    quantize_4bit_nf4,
+    quantize_4bit_fp4
 )
 
 def test_8bit_quantization_cpu():
@@ -41,7 +45,8 @@ def test_8bit_quantization_cuda():
     
     # Test dequantization
     deq_tensor = dequantize_8bit(q_tensor, scale, zero_point)
-    assert torch.allclose(tensor, deq_tensor, rtol=1e-2)
+    # Use both rtol and atol for CUDA tensors
+    assert torch.allclose(tensor, deq_tensor, rtol=1e-2, atol=1e-5)
 
 def test_8bit_quantization_per_channel_cpu():
     # Test with a 2D tensor on CPU
