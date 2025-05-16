@@ -85,19 +85,6 @@ def quantize_4bit_nf4(tensor):
     
     return indices.to(torch.uint8), abs_max, nf4_levels
 
-def quantize_8bit_nf8(tensor):
-
-    nf8_levels = torch.linspace(-1 , 1, 256)
-    nf8_levels = torch.tanh(nf8_levels * 2)
-
-    abs_max = torch.max(torch.abs(tensor))
-    normalized = tensor / abs_max
-    expanded = normalized.unsqueeze(-1)
-    distances = torch.abs(expanded - nf8_levels)
-    indices = torch.argmin(distances, dim=-1)
-    
-    return indices.to(torch.uint8), abs_max, nf8_levels
-
 def quantize_4bit_fp4(tensor):
     signs = torch.sign(tensor)
     abs_values = torch.abs(tensor)
@@ -112,25 +99,6 @@ def quantize_4bit_fp4(tensor):
     q_tensor = torch.where(signs < 0, q_tensor | 0x8, q_tensor)
     
     return q_tensor, exp_bias
-
-def quantize_8bit_fp8(tensor):
-    signs = torch.sign(tensor)
-    abs_values = torch.abs(tensor)
-
-    log_values = torch.log2(abs_values + (abs_values == 0).float())
-
-    exp_bias = 7 
-    exp_values = torch.clamp( torch.round(log_values + exp_bias), 0 , 15)
-
-    mantissa_values = torch.round((abs_values / (2 ** (exp_values - exp_bias))) * 8 - 8)
-    mantissa_values = torch.clamp(mantissa_values, 0, 7)
-
-    q_tensor = ((exp_values << 3) | mantissa_values).to(torch.uint8)
-    
-    q_tensor = torch.where(signs < 0, q_tensor | 0x80, q_tensor)
-    
-    return q_tensor, exp_bias
-
 
 def quantize_8bit_linear(tensor, per_channel=False):
     """
