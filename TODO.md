@@ -1,24 +1,26 @@
+# Bits-and-Byes Project Roadmap
+
 ## Core Library Foundation
 - [X] Implement basic tensor operations
-- [ ] Create CPU fallback implementations
+- [X] Create CPU fallback implementations
 - [ ] Design modular architecture for different hardware support
-- [ ] Implement base classes for quantization
+- [X] Implement base classes for quantization
 - [ ] Set up unit testing framework
-- [ ] Create benchmarking infrastructure
+- [X] Create benchmarking infrastructure
 - [ ] Implement version compatibility checking
 
 ## Quantization Primitives
-- [ ] Implement 8-bit quantization algorithms
-- [ ] Implement 4-bit quantization algorithms
-- [ ] Add support for different quantization schemes (symmetric/asymmetric)
+- [X] Implement 8-bit quantization algorithms
+- [X] Implement 4-bit quantization algorithms
+- [X] Add support for different quantization schemes (symmetric/asymmetric)
 - [ ] Implement quantization state management
 - [ ] Create tensor conversion utilities
 - [ ] Add dequantization operations
 - [ ] Implement calibration methods for quantization
 
 ## Linear Layers Implementation
-- [ ] Create 8-bit linear layer (Linear8bitLt)
-- [ ] Create 4-bit linear layer (Linear4bit)
+- [] Create 8-bit linear layer (Linear8bitLt)
+- [X] Create 4-bit linear layer (Linear4bit)
 - [ ] Implement matrix multiplication kernels
 - [ ] Add support for different quantization strategies
 - [ ] Create specialized backward pass implementations

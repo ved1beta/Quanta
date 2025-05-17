@@ -15,6 +15,12 @@ from .quantization import (
     quantize_4bit_fp4
 )
 
+from .state import (
+    QuantizationState,
+    QuantizationScheme,
+    QuantizationType
+)
+
 __all__ = [
     "quantize_8bit",
     "quantize_4bit",
@@ -25,5 +31,8 @@ __all__ = [
     "quantize_8bit_fp8",
     "quantize_4bit_linear",
     "quantize_4bit_nf4",
-    "quantize_4bit_fp4"
+    "quantize_4bit_fp4",
+    "QuantizationState",
+    "QuantizationScheme",
+    "QuantizationType"
 ] 
