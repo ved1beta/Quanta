@@ -141,7 +141,7 @@ class QuantizationState:
             q_tensor: The quantized tensor to save
             file_path: Path where to save the file
         """
-        from ..utils.tensor_utils import save_quantized_tensor, save_quantized_tensor_torch
+        from ..utils.utils import save_quantized_tensor, save_quantized_tensor_torch
         
         params = self.get_tensor_params(tensor_name)
         if params is None:
@@ -173,7 +173,7 @@ class QuantizationState:
         Returns:
             The loaded quantized tensor
         """
-        from ..utils.tensor_utils import load_quantized_tensor, load_quantized_tensor_torch
+        from ..utils.utils import load_quantized_tensor, load_quantized_tensor_torch
         
         if file_path.endswith('.pt'):
             q_tensor, scale, zero_point, params = load_quantized_tensor_torch(file_path)
@@ -189,7 +189,59 @@ class QuantizationState:
         # Update state with loaded parameters
         self.set_tensor_params(tensor_name, params)
         
+        # Store the tensor in the state for easy access later
+        if not hasattr(self, "_quantized_tensors"):
+            self._quantized_tensors = {}
+        self._quantized_tensors[tensor_name] = q_tensor
+        
         return q_tensor
+        
+    def convert_tensor_precision(self, tensor_name: str, target_bits: int, target_type: str = "linear", 
+                                target_scheme: str = None) -> torch.Tensor:
+        """
+        Convert a tensor to a different precision format and update its state.
+        
+        Args:
+            tensor_name: Name of the tensor in the state
+            target_bits: Target bit depth (4 or 8)
+            target_type: Target quantization type
+            target_scheme: Target quantization scheme (if None, use source scheme)
+            
+        Returns:
+            The converted quantized tensor
+        """
+        from ..utils.utils import convert_precision
+        
+        # Get original tensor and parameters
+        source_params = self.get_tensor_params(tensor_name)
+        if source_params is None:
+            raise ValueError(f"No parameters found for tensor '{tensor_name}' in state")
+        
+        # Get the quantized tensor
+        if hasattr(self, "_quantized_tensors") and tensor_name in self._quantized_tensors:
+            q_tensor = self._quantized_tensors[tensor_name]
+        else:
+            raise ValueError(f"Quantized tensor '{tensor_name}' not found in state. "
+                           f"Please load the tensor first using load_quantized_tensor_with_state.")
+        
+        # Convert to target precision
+        new_q_tensor, new_scale, new_zero_point, new_params = convert_precision(
+            q_tensor, 
+            source_params, 
+            target_bits, 
+            target_type,
+            target_scheme
+        )
+        
+        # Update the state with new parameters
+        self.set_tensor_params(tensor_name, new_params)
+        
+        # Store the new quantized tensor
+        if not hasattr(self, "_quantized_tensors"):
+            self._quantized_tensors = {}
+        self._quantized_tensors[tensor_name] = new_q_tensor
+        
+        return new_q_tensor
         
     def dequantize_tensor(self, tensor_name: str, q_tensor: torch.Tensor) -> torch.Tensor:
         """

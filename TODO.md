@@ -10,7 +10,7 @@
 - [X] Implement quantization state management
 - [X] Create tensor conversion utilities
 - [X] Implement serialization/deserialization for quantized tensors
-- [ ] Add conversion between different precision formats
+- [X] Add conversion between different precision formats
 
 ## Phase 3: Model Quantization (MVP)
 - [ ] Create model quantization wrapper API
