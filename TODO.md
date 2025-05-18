@@ -1,98 +1,50 @@
-## Core Library Foundation
-- [X] Implement basic tensor operations
-- [X] Create CPU fallback implementations
-- [ ] Design modular architecture for different hardware support
-- [X] Implement base classes for quantization
-- [ ] Set up unit testing framework
-- [X] Create benchmarking infrastructure
-- [ ] Implement version compatibility checking
+# BytesAndBits MVP Roadmap
 
-## Quantization Primitives
-- [X] Implement 8-bit quantization algorithms
+## Phase 1: Core Quantization (DONE)
+- [X] Implement 8-bit quantization algorithms 
 - [X] Implement 4-bit quantization algorithms
 - [X] Add support for different quantization schemes (symmetric/asymmetric)
+- [X] Implement base classes for quantization
+
+## Phase 2: Quantization State Management (CURRENT)
 - [X] Implement quantization state management
-- [ ] Create tensor conversion utilities
-- [ ] Add dequantization operations
-- [ ] Implement calibration methods for quantization
+- [X] Create tensor conversion utilities
+- [ ] Implement serialization/deserialization for quantized tensors
+- [ ] Add conversion between different precision formats
 
-## Linear Layers Implementation
-- [ ] Create 8-bit linear layer (Linear8bitLt)
-- [ ] Create 4-bit linear layer (Linear4bit)
-- [ ] Implement matrix multiplication kernels
-- [ ] Add support for different quantization strategies
-- [ ] Create specialized backward pass implementations
-- [ ] Implement outlier handling for LLM.int8()
-- [ ] Add optimized CUDA kernels for different GPU architectures
+## Phase 3: Model Quantization (MVP)
+- [ ] Create model quantization wrapper API
+- [ ] Implement per-layer configuration for mixed precision
+- [ ] Add weight-only quantization for inference
+- [ ] Create model export/import functionality
+- [ ] Implement tensor packing for efficient storage
 
-## Optimizers
-- [ ] Implement 8-bit Adam optimizer
-- [ ] Implement 8-bit Lion optimizer
-- [ ] Add block-wise quantization for optimizers
-- [ ] Implement optimizer state management
-- [ ] Create memory-efficient parameter management
-- [ ] Add support for different precision options
-- [ ] Implement optimizer state loading/saving
+## Phase 4: Post-Training Quantization (MVP)
+- [ ] Implement calibration methods for quantization (min/max, entropy, percentile)
+- [ ] Add support for representative dataset calibration
+- [ ] Create outlier handling for activation quantization
+- [ ] Add quantization-aware activation clipping
+- [ ] Implement static vs dynamic quantization modes
 
-## PyTorch Integration
-- [ ] Create PyTorch extension module
-- [ ] Implement custom CUDA operations
-- [ ] Add JIT/TorchScript compatibility
-- [ ] Create model conversion utilities
-- [ ] Implement hooks for automatic quantization
-- [ ] Create custom autograd functions
-- [ ] Add support for distributed training
+## Phase 5: Pre-Training Quantization Setup (MVP)
+- [ ] Create quantization-aware training helpers
+- [ ] Implement fake quantization for training
+- [ ] Add gradient scaling for low-precision training
+- [ ] Create QAT (Quantization-Aware Training) module wrappers
+- [ ] Add support for custom quantization configurations during training
 
-## Hardware Support
-- [ ] Add support for NVIDIA GPUs
-- [ ] Implement CPU fallbacks for all operations
-- [ ] Add AMD GPU support
-- [ ] Explore Intel XPU compatibility
-- [ ] Optimize for different CUDA compute capabilities
-- [ ] Add Apple Silicon support
-- [ ] Implement hardware detection and optimization
+## Phase 6: Integration & Example Models (MVP)
+- [ ] Add quantization examples for common architectures (ResNet, BERT, etc.)
+- [ ] Create benchmarking scripts for quantized vs. full-precision
+- [ ] Add documentation for integration patterns
+- [ ] Create simple CLI for model quantization
+- [ ] Implement visualization tools for quantization statistics
 
-## Advanced Features
-- [ ] Implement mixed-precision training
-- [ ] Add support for LoRA integration
-- [ ] Create model compression utilities
-- [ ] Implement dynamic quantization
-- [ ] Add attention mechanism optimizations
-- [ ] Create memory profiling tools
-- [ ] Implement checkpoint management
-
-## Performance Optimization
-- [ ] Profile and optimize critical paths
-- [ ] Implement kernel fusion where applicable
-- [ ] Add caching mechanisms
-- [ ] Optimize memory usage patterns
-- [ ] Implement parallelization strategies
-- [ ] Add support for tensor cores
-- [ ] Create performance benchmarking suite
-
-## Documentation and Examples
-- [ ] Write comprehensive API documentation
-- [ ] Create tutorials for common use cases
-- [ ] Add examples for integration with popular frameworks
-- [ ] Create benchmark results and comparisons
-- [ ] Write detailed installation instructions
-- [ ] Add troubleshooting guide
-- [ ] Create visual demonstrations
-
-## Testing and Quality Assurance
-- [ ] Implement unit tests for all components
-- [ ] Create integration tests with PyTorch
-- [ ] Add performance regression tests
-- [ ] Implement correctness validation
-- [ ] Set up model compatibility testing
-- [ ] Create stress tests for memory usage
-- [ ] Add cross-platform compatibility tests
-
-## Deployment and Distribution
-- [ ] Configure PyPI package distribution
-- [ ] Set up conda package distribution
-- [ ] Create pre-built binaries for different platforms
-- [ ] Implement version management
-- [ ] Configure automated releases
-- [ ] Set up compatibility verification
-- [ ] Create installation scripts 
+## Future Roadmap (Post-MVP)
+- [ ] Optimizers (8-bit Adam, Lion)
+- [ ] Hardware-specific optimizations (CUDA kernels)
+- [ ] Additional hardware support (AMD, Intel)
+- [ ] Advanced features (LoRA integration, mixed-precision)
+- [ ] Performance optimization (kernel fusion, caching)
+- [ ] Deployment utilities (export to various formats)
+- [ ] Distributed training support
