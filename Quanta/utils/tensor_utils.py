@@ -54,11 +54,10 @@ def save_quantized_tensor(q_tensor, scale, zero_point, params, file_path):
         zero_point_np = zero_point.cpu().numpy()
     else:
         zero_point_np = zero_point
-    
-    # Convert torch.dtype to string and remove torch. prefix
+
     dtype_str = str(q_tensor.dtype)
     if dtype_str.startswith('torch.'):
-        dtype_str = dtype_str[6:]  # Remove 'torch.' prefix
+        dtype_str = dtype_str[6:]
     
     metadata = {
         'bits': params.get('bits', 8),
@@ -102,20 +101,16 @@ def load_quantized_tensor(file_path):
         elif dtype_name == 'float32':
             numpy_dtype = np.float32
         else:
-            numpy_dtype = np.uint8  # Default fallback
+            numpy_dtype = np.uint8  
         
-        # Read quantized tensor data (always stored as uint8)
         q_tensor_size = np.prod(shape) * (np.dtype(np.uint8).itemsize)
         q_tensor_bytes = f.read(int(q_tensor_size))
         
-        # Create a writeable copy of the array to avoid the warning
         q_tensor_np = np.frombuffer(q_tensor_bytes, dtype=np.uint8).copy()
         q_tensor_np = q_tensor_np.reshape(shape)
         
-        # Convert to torch tensor with correct dtype
         q_tensor = torch.from_numpy(q_tensor_np)
         
-        # Read scale and zero_point
         if bits == 8:
             scale_dtype = np.float32
             zero_point_dtype = np.float32 if metadata['scheme'] == 'asymmetric' else np.float32
@@ -123,7 +118,6 @@ def load_quantized_tensor(file_path):
             scale_dtype = np.float32
             zero_point_dtype = np.float32
             
-        # For simplicity, assume per-tensor quantization for now
         scale_np = np.frombuffer(f.read(np.dtype(scale_dtype).itemsize), dtype=scale_dtype).copy()
         zero_point_np = np.frombuffer(f.read(np.dtype(zero_point_dtype).itemsize), dtype=zero_point_dtype).copy()
         

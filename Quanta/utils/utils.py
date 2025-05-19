@@ -228,18 +228,15 @@ def convert_precision(q_tensor, source_params, target_bits, target_type="linear"
     Returns:
         Tuple of (converted quantized tensor, new scale, new zero_point, new params)
     """
-    # Get source parameters
     source_bits = source_params.get('bits', 8)
     source_type = source_params.get('type', 'linear')
     source_scale = source_params.get('scale')
     source_zero_point = source_params.get('zero_point')
     source_scheme = source_params.get('scheme', 'symmetric')
     
-    # If target scheme not specified, keep the same
     if target_scheme is None:
         target_scheme = source_scheme
     
-    # First dequantize to full precision
     if source_bits == 8:
         fp_tensor = dequantize_8bit(
             q_tensor,
@@ -257,7 +254,6 @@ def convert_precision(q_tensor, source_params, target_bits, target_type="linear"
     else:
         raise ValueError(f"Unsupported source bit depth: {source_bits}")
     
-    # Then requantize to target precision
     if target_bits == 8:
         new_q_tensor, new_scale, new_zero_point = quantize_8bit(
             fp_tensor,
@@ -271,7 +267,6 @@ def convert_precision(q_tensor, source_params, target_bits, target_type="linear"
     else:
         raise ValueError(f"Unsupported target bit depth: {target_bits}")
     
-    # Create new parameters dict
     new_params = {
         'bits': target_bits,
         'type': target_type,
@@ -323,7 +318,6 @@ def optimize_for_target_hardware(q_tensor, source_params, target_hardware):
     Returns:
         Optimized tensor with parameters
     """
-    # Define hardware-specific configuration
     hw_config = {
         "cpu": {"bits": 8, "type": "linear"},
         "gpu": {"bits": 8, "type": "linear"},
@@ -331,10 +325,8 @@ def optimize_for_target_hardware(q_tensor, source_params, target_hardware):
         "edge": {"bits": 4, "type": "linear"},
     }
     
-    # Get configuration or use default
     config = hw_config.get(target_hardware, {"bits": 8, "type": "linear"})
     
-    # Convert to target precision
     return convert_precision(
         q_tensor, 
         source_params, 
