@@ -1,31 +1,31 @@
-# Bits-and-Byes
+# Quanta 🚀
 
-Bits-and-Byes is a library for efficient quantization and memory optimization in PyTorch, designed to make large language models and deep learning more accessible.
+A lightweight PyTorch library for efficient model quantization and memory optimization. Perfect for running large language models on consumer hardware.
 
-## Features
+## Key Features
 
-- 8-bit and 4-bit quantization primitives for PyTorch
-- Memory-efficient optimizers with block-wise quantization
-- LLM.int8() inference with minimal performance degradation
-- QLoRA-style fine-tuning for large language models
-- Cross-platform support for various hardware accelerators
+- 🎯 8-bit & 4-bit quantization primitives
+- 💾 Memory-efficient optimizers
+- 🚀 LLM.int8() inference support
+- 🔄 QLoRA-style fine-tuning
+- 🖥️ Cross-platform hardware support
 
-## Project Status
+## Quick Start
 
-⚠️ **Early Development** - This project is currently in the initial planning and development phase.
+```python
+import torch
+from bytesandbits.functional.quantization import quantize_8bit, dequantize_8bit
 
-## Getting Started
+# Quantize your model
+q_tensor, scale, zero_point = quantize_8bit(model_weights)
+```
 
-See the [TODO.md](TODO.md) file for the project roadmap and current development status.
+## Status
 
-Detailed elaborations for major tasks:
-- [Initial Setup and Project Structure](task1_initial_setup.md)
-- [Core Library Foundation](task2_core_library.md)
+🚧 Early Development - Currently implementing core quantization features.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License
 
-## Acknowledgments
-
-This project is inspired by the [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) library. 
+Inspired by [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes)
