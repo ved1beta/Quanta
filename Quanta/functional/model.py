@@ -352,6 +352,58 @@ class ModelQuantize:
             self.quantized_model = torch.jit.load(f"{path}.pt")
         
         return self.quantized_model
+    
+    def calibrate(self, calibration_data, method="minmax"):
+        """
+        Calibrate quantization parameters using a dataset.
+
+        Args:
+            calibration_data: PyTorch DataLoader or tensor batch
+            method: Calibration method - "minmax", "entropy", or "percentile"
+        """
+        self._register_activation_hooks()
+        
+        self._collect_stats_from_data(calibration_data)
+        
+        if method == "minmax":
+            self._calibrate_minmax()
+        elif method == "entropy":
+            self._calibrate_entropy()
+        elif method == "percentile":
+            self._calibrate_percentile(percentile=99.9)
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
+        
+    def _calibrate_minmax(self):
+        for name in self.activation_stats.keys():
+            scale , zero_point = self._calibrate_layer(name , "minmax")
+            self.state.set_tensor_params(f"{name}.activation", {
+            'scale': scale,
+            'zero_point': zero_point,
+            'calibration_method': 'minmax'
+        })
+            
+    def _calibrate_entropy(self):
+        for name in self.activation_stats.keys():
+            scale, zero_point = self._calibrate_layer(name, "entropy")
+            self.state.set_tensor_params(f"{name}.activation", {
+            'scale': scale,
+            'zero_point': zero_point,
+            'calibration_method': 'entropy'
+        })
+
+    def _calibrate_percentile(self, percentile=99.9):
+        for name in self.activation_stats.keys():
+            scale, zero_point = self._calibrate_layer(name, "percentile")
+            self.state.set_tensor_params(f"{name}.activation", {
+                'scale': scale,
+                'zero_point': zero_point,
+                'calibration_method': 'percentile',
+                'percentile': percentile
+            })
+
+
+
 
 
 
