@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 import os
 import sys
 
-# Read version from bitsandbyes/__init__.py
-with open(os.path.join("bitsandbyes", "__init__.py"), "r") as f:
+# Read version from Quanta/__init__.py
+with open(os.path.join("Quanta", "__init__.py"), "r") as f:
     for line in f:
         if line.startswith("__version__"):
             version = line.split("=")[1].strip().strip('"\'')
@@ -22,14 +22,14 @@ requirements = [
 ]
 
 setup(
-    name="bits-and-byes",
+    name="quanta",
     version=version,
-    author="Bits-and-Byes Contributors",
+    author="Quanta Contributors",
     author_email="your-email@example.com",
     description="A library for efficient quantization and memory optimization in PyTorch",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/bits-and-byes",
+    url="https://github.com/yourusername/quanta",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",

@@ -13,7 +13,7 @@
 - [X] Add conversion between different precision formats
 
 ## Phase 3: Model Quantization (MVP)
-- [ ] Create model quantization wrapper API
+- [X] Create model quantization wrapper API
 - [ ] Implement per-layer configuration for mixed precision
 - [ ] Add weight-only quantization for inference
 - [ ] Create model export/import functionality
