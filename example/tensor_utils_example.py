@@ -3,7 +3,7 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bytesandbits.utils.tensor_utils import pack_4bit_tensor, unpack_4bit_tensor, tensor_bits_to_bytes
+from Quanta.utils.tensor_utils import pack_4bit_tensor, unpack_4bit_tensor, tensor_bits_to_bytes
 
 def example_4bit_packing():
     print("=== 4-bit Tensor Packing Example ===")

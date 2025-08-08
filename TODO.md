@@ -1,4 +1,4 @@
-# BytesAndBits MVP Roadmap
+# Quanta MVP Roadmap
 
 ## Phase 1: Core Quantization (DONE)
 - [X] Implement 8-bit quantization algorithms 

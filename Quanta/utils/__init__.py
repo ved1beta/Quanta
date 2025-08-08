@@ -1,5 +1,5 @@
 """
-Utility functions for BytesAndBits.
+Utility functions for Quanta.
 """
 
 from .utils import (
