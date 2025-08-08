@@ -1,5 +1,5 @@
 """
-Utility functions for BytesAndBits.
+Utility functions for Quanta.
 
 This module provides various utility functions for tensor operations, serialization,
 and precision conversion.

@@ -9,13 +9,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import time
 import numpy as np
-from bytesandbits.functional.quantization import (
+from Quanta.functional.quantization import (
     quantize_8bit, dequantize_8bit,
     quantize_4bit, dequantize_4bit,
     quantize_8bit_linear, quantize_8bit_nf8, quantize_8bit_fp8,
     quantize_4bit_linear, quantize_4bit_nf4, quantize_4bit_fp4
 )
-from bytesandbits.functional.base import BaseQuantizer
+from Quanta.functional.base import BaseQuantizer
 import psutil
 
 def get_memory_usage():

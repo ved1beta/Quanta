@@ -4,7 +4,7 @@ Tests and examples for the BaseQuantizer class.
 
 import torch
 import pytest
-from bytesandbits.functional.base import BaseQuantizer
+from Quanta.functional.base import BaseQuantizer
 
 def test_symmetric_quantization():
     """Test symmetric quantization with different bit widths."""

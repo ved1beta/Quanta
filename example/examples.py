@@ -4,8 +4,8 @@ Examples demonstrating the usage of quantization functions.
 
 import torch
 import numpy as np
-from bytesandbits.functional.quantization import quantize_8bit, dequantize_8bit, quantize_4bit, dequantize_4bit
-from bytesandbits.functional.base import BaseQuantizer
+from Quanta.functional.quantization import quantize_8bit, dequantize_8bit, quantize_4bit, dequantize_4bit
+from Quanta.functional.base import BaseQuantizer
 
 def example_8bit_quantization():
     """Example of basic 8-bit quantization and dequantization."""

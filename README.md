@@ -14,7 +14,7 @@ A lightweight PyTorch library for efficient model quantization and memory optimi
 
 ```python
 import torch
-from bytesandbits.functional.quantization import quantize_8bit, dequantize_8bit
+from Quanta.functional.quantization import quantize_8bit, dequantize_8bit
 
 # Quantize your model
 q_tensor, scale, zero_point = quantize_8bit(model_weights)

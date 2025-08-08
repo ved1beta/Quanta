@@ -4,7 +4,7 @@ Tests for quantization and dequantization functions.
 
 import torch
 import pytest
-from bytesandbits.functional.quantization import (
+from Quanta.functional.quantization import (
     quantize_8bit,
     dequantize_8bit,
     quantize_4bit,

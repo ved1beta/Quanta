@@ -7,14 +7,14 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bytesandbits.functional.state import QuantizationState, QuantizationScheme, QuantizationType
-from bytesandbits.functional.quantization import (
+from Quanta.functional.state import QuantizationState, QuantizationScheme, QuantizationType
+from Quanta.functional.quantization import (
     quantize_8bit, 
     quantize_4bit, 
     dequantize_8bit, 
     dequantize_4bit
 )
-from bytesandbits.utils.utils import (
+from Quanta.utils.utils import (
     convert_precision,
     convert_8bit_to_4bit,
     convert_4bit_to_8bit,
