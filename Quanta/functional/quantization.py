@@ -254,6 +254,27 @@ def dequantize(state: QuantState) -> torch.Tensor:
     if state.scheme in ("int8_linear", "int4_linear"):
         return _dequant_linear(state)
     if state.scheme in ("nf4", "nf8", "fp4"):
+        # Triton fast path for blockwise nf4 on CUDA (bit-exact to eager).
+        if (
+            _TRITON_ENABLED
+            and state.scheme == "nf4"
+            and state.packed
+            and state.block_size is not None
+            and state.qdata.is_cuda
+        ):
+            try:
+                from Quanta.backends.triton_nf4 import (
+                    nf4_decode_blockwise_triton,
+                    triton_available,
+                )
+                if triton_available():
+                    out = nf4_decode_blockwise_triton(
+                        state.qdata, state.absmax, state.code,
+                        state.shape, state.block_size,
+                    )
+                    return out.to(state.dtype)
+            except Exception:
+                pass  # fall through
         return _dequant_codebook(state)
     if state.scheme == "fp8":
         return _dequant_fp8(state)

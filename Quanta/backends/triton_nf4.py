@@ -119,6 +119,42 @@ if _TRITON_OK:
         tl.store(packed_ptr + out_off, packed.to(tl.uint8), mask=out_mask)
 
 
+if _TRITON_OK:
+
+    @triton.jit
+    def _nf4_dequant_blockwise_kernel(
+        packed_ptr,         # *uint8, [n_padded // 2]
+        absmax_ptr,         # *fp32, [num_blocks]
+        code_ptr,           # *fp32, [16] — NF4 codebook
+        out_ptr,            # *fp32, [n_elements]
+        n_elements,
+        BLOCK: tl.constexpr,   # must match encode block_size
+        HALF: tl.constexpr,    # BLOCK // 2
+    ):
+        pid = tl.program_id(0)
+        absmax = tl.load(absmax_ptr + pid)
+
+        pair_arange = tl.arange(0, HALF)
+        packed_off = pid * HALF + pair_arange
+        even_off = pid * BLOCK + pair_arange * 2
+        odd_off = even_off + 1
+
+        even_mask = even_off < n_elements
+        odd_mask = odd_off < n_elements
+
+        packed = tl.load(packed_ptr + packed_off, mask=even_mask, other=0)
+        low = (packed & 0xF).to(tl.int32)
+        high = ((packed >> 4) & 0xF).to(tl.int32)
+
+        # Gather from 16-entry codebook. Triton lowers this to a shared/L1-cached
+        # indirect load; for a 16-entry table this is ~free.
+        low_val = tl.load(code_ptr + low) * absmax
+        high_val = tl.load(code_ptr + high) * absmax
+
+        tl.store(out_ptr + even_off, low_val, mask=even_mask)
+        tl.store(out_ptr + odd_off, high_val, mask=odd_mask)
+
+
 def triton_available() -> bool:
     return _TRITON_OK and torch.cuda.is_available()
 
@@ -161,3 +197,39 @@ def nf4_encode_blockwise_triton(x: torch.Tensor, block_size: int = 64):
         E12=_NF4_EDGES[12], E13=_NF4_EDGES[13], E14=_NF4_EDGES[14],
     )
     return packed, absmax, n
+
+
+def nf4_decode_blockwise_triton(
+    packed: torch.Tensor,
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    shape: torch.Size,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """Blockwise NF4 dequant using the fused Triton kernel.
+
+    Loads packed bytes, splits into nibbles, gathers the codebook value, scales
+    by per-block absmax, and writes fp32 output — all in one kernel launch.
+    """
+    if not triton_available():
+        raise RuntimeError("Triton / CUDA not available")
+    if not packed.is_cuda:
+        raise ValueError("Input must be on CUDA")
+    if block_size % 2 != 0:
+        raise ValueError("block_size must be even")
+
+    code = code.to(torch.float32).contiguous()
+    n_elements = 1
+    for s in shape:
+        n_elements *= s
+    num_blocks = (n_elements + block_size - 1) // block_size
+
+    out = torch.empty(n_elements, device=packed.device, dtype=torch.float32)
+    grid = (num_blocks,)
+    _nf4_dequant_blockwise_kernel[grid](
+        packed, absmax, code, out,
+        n_elements,
+        BLOCK=block_size,
+        HALF=block_size // 2,
+    )
+    return out.view(shape)
