@@ -30,7 +30,7 @@ Design choices worth calling out:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -93,8 +93,7 @@ def _fp4_code(device, dtype):
 
 
 def _codebook_encode(normalized: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
-    """Assign each e--------------------------------------------------------------------------
-lement the index of its nearest level, using bucketize on
+    """Assign each element the index of its nearest level, using bucketize on
     midpoint edges. Returns indices into the ORIGINAL (unsorted) codebook."""
     sorted_levels, order = torch.sort(levels)
     edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
