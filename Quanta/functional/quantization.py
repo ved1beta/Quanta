@@ -29,10 +29,35 @@ Design choices worth calling out:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
+
+# -----------------------------------------------------------------------------
+# torch.compile hot paths.
+#
+# Gated via QUANTA_DISABLE_COMPILE=1 so users without a compile-capable backend
+# (or who hit a dynamic-shape edge case) can fall back to eager.
+# -----------------------------------------------------------------------------
+_COMPILE_ENABLED = (
+    hasattr(torch, "compile")
+    and os.environ.get("QUANTA_DISABLE_COMPILE", "0") != "1"
+)
+
+# Triton kernel is opt-out the same way.
+_TRITON_ENABLED = os.environ.get("QUANTA_DISABLE_TRITON", "0") != "1"
+
+
+def _maybe_compile(fn):
+    """torch.compile with dynamic=True when available, identity otherwise."""
+    if not _COMPILE_ENABLED:
+        return fn
+    try:
+        return torch.compile(fn, dynamic=True, fullgraph=False)
+    except Exception:
+        return fn
 
 
 
@@ -68,7 +93,8 @@ def _fp4_code(device, dtype):
 
 
 def _codebook_encode(normalized: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
-    """Assign each element the index of its nearest level, using bucketize on
+    """Assign each e--------------------------------------------------------------------------
+lement the index of its nearest level, using bucketize on
     midpoint edges. Returns indices into the ORIGINAL (unsorted) codebook."""
     sorted_levels, order = torch.sort(levels)
     edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
@@ -128,6 +154,40 @@ def _pad_for_blocks(x: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, int
     return flat.view(-1, block_size), pad
 
 
+
+def _linear_encode_blockwise_eager(blocks: torch.Tensor, qmax: int):
+    absmax = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+    q = torch.round(blocks / absmax * qmax).clamp(-qmax, qmax).to(torch.int8)
+    return q, absmax.squeeze(-1)
+
+
+def _linear_encode_pertensor_eager(x: torch.Tensor, qmax: int):
+    absmax = x.abs().amax().clamp(min=1e-8)
+    q = torch.round(x / absmax * qmax).clamp(-qmax, qmax).to(torch.int8)
+    return q, absmax
+
+
+def _linear_decode_blockwise_eager(q: torch.Tensor, absmax: torch.Tensor, qmax: int):
+    # q: [num_blocks, block_size] int8, absmax: [num_blocks] float32
+    return q.float() * (absmax.unsqueeze(-1) / qmax)
+
+
+def _linear_decode_pertensor_eager(q: torch.Tensor, absmax: torch.Tensor, qmax: int):
+    return q.float() * (absmax / qmax)
+
+
+def _codebook_decode_eager(idx_long: torch.Tensor, code: torch.Tensor, absmax_mul: torch.Tensor):
+    # idx_long: long-dtype index tensor; absmax_mul broadcastable to idx shape
+    return code[idx_long] * absmax_mul
+
+
+_linear_encode_blockwise = _maybe_compile(_linear_encode_blockwise_eager)
+_linear_encode_pertensor = _maybe_compile(_linear_encode_pertensor_eager)
+_linear_decode_blockwise = _maybe_compile(_linear_decode_blockwise_eager)
+_linear_decode_pertensor = _maybe_compile(_linear_decode_pertensor_eager)
+_codebook_decode = _maybe_compile(_codebook_decode_eager)
+
+
 def quantize(
     x: torch.Tensor,
     scheme: str = "int8_linear",
@@ -150,6 +210,32 @@ def quantize(
     if scheme == "int4_linear":
         return _quant_linear(x32, bits=4, orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf4":
+        # Fast path: Triton kernel for blockwise nf4 on CUDA (bit-exact to eager).
+        if (
+            _TRITON_ENABLED
+            and block_size is not None
+            and x.is_cuda
+            and block_size % 2 == 0
+        ):
+            try:
+                from Quanta.backends.triton_nf4 import (
+                    nf4_encode_blockwise_triton,
+                    triton_available,
+                )
+                if triton_available():
+                    packed, absmax, _ = nf4_encode_blockwise_triton(x32, block_size)
+                    return QuantState(
+                        qdata=packed,
+                        scheme="nf4",
+                        shape=orig_shape,
+                        dtype=orig_dtype,
+                        absmax=absmax,
+                        block_size=block_size,
+                        packed=True,
+                        code=_nf4_levels(x.device, torch.float32),
+                    )
+            except Exception:
+                pass  # fall through to eager
         return _quant_codebook(x32, levels=_nf4_levels(x.device, torch.float32), bits=4, scheme="nf4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf8":
@@ -178,25 +264,22 @@ def _quant_linear(x, *, bits, orig_shape, orig_dtype, block_size):
     qmax = (1 << (bits - 1)) - 1  # 127 for int8, 7 for int4
     if block_size:
         blocks, pad = _pad_for_blocks(x, block_size)
-        absmax = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
-        q = torch.round(blocks / absmax * qmax).clamp(-qmax, qmax).to(torch.int8)
+        q, absmax = _linear_encode_blockwise(blocks, qmax)
         q = q.reshape(-1)
         if pad:
             q = q[:-pad]
         qdata = q.reshape(orig_shape)
-        state = QuantState(
+        return QuantState(
             qdata=_maybe_pack(qdata, bits),
             scheme="int8_linear" if bits == 8 else "int4_linear",
             shape=orig_shape,
             dtype=orig_dtype,
-            absmax=absmax.squeeze(-1),
+            absmax=absmax,
             block_size=block_size,
             packed=(bits == 4),
         )
-        return state
     # per-tensor
-    absmax = x.abs().amax().clamp(min=1e-8)
-    q = torch.round(x / absmax * qmax).clamp(-qmax, qmax).to(torch.int8)
+    q, absmax = _linear_encode_pertensor(x, qmax)
     qdata = q.reshape(orig_shape)
     return QuantState(
         qdata=_maybe_pack(qdata, bits),
@@ -226,17 +309,19 @@ def _maybe_unpack(state: QuantState) -> torch.Tensor:
 
 def _dequant_linear(state: QuantState) -> torch.Tensor:
     qmax = 127 if state.scheme == "int8_linear" else 7
-    q = _maybe_unpack(state).to(torch.float32)
+    q = _maybe_unpack(state)
     if state.block_size:
         flat = q.reshape(-1)
         pad = (-flat.numel()) % state.block_size
         if pad:
-            flat = torch.cat([flat, torch.zeros(pad, device=flat.device)])
+            flat = torch.cat([flat, torch.zeros(pad, device=flat.device, dtype=flat.dtype)])
         blocks = flat.view(-1, state.block_size)
-        out = blocks * (state.absmax.unsqueeze(-1) / qmax)
-        out = out.reshape(-1)[:flat.numel() - pad] if pad else out.reshape(-1)
+        out = _linear_decode_blockwise(blocks, state.absmax, qmax)
+        out = out.reshape(-1)
+        if pad:
+            out = out[:out.numel() - pad]
         return out.reshape(state.shape).to(state.dtype)
-    return (q * (state.absmax / qmax)).reshape(state.shape).to(state.dtype)
+    return _linear_decode_pertensor(q, state.absmax, qmax).reshape(state.shape).to(state.dtype)
 
 
 
@@ -286,17 +371,18 @@ def _dequant_codebook(state: QuantState) -> torch.Tensor:
         idx = unpack_4bit(state.qdata, state.shape).to(torch.long)
     else:
         idx = state.qdata.to(torch.long)
-    decoded = state.code[idx]
     if state.block_size:
-        flat = decoded.reshape(-1)
-        pad = (-flat.numel()) % state.block_size
+        flat_idx = idx.reshape(-1)
+        pad = (-flat_idx.numel()) % state.block_size
         if pad:
-            flat = torch.cat([flat, torch.zeros(pad, device=flat.device, dtype=flat.dtype)])
-        blocks = flat.view(-1, state.block_size)
-        out = (blocks * state.absmax.unsqueeze(-1)).reshape(-1)
-        out = out[:flat.numel() - pad] if pad else out
+            flat_idx = torch.cat([flat_idx, torch.zeros(pad, device=flat_idx.device, dtype=flat_idx.dtype)])
+        blocks = flat_idx.view(-1, state.block_size)
+        out = _codebook_decode(blocks, state.code, state.absmax.unsqueeze(-1))
+        out = out.reshape(-1)
+        if pad:
+            out = out[:out.numel() - pad]
         return out.reshape(state.shape).to(state.dtype)
-    return (decoded * state.absmax).reshape(state.shape).to(state.dtype)
+    return _codebook_decode(idx, state.code, state.absmax).reshape(state.shape).to(state.dtype)
 
 
 
