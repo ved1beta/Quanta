@@ -1,105 +1,121 @@
-import torch 
-from torch.autograd import Function
+"""
+Element-wise and matmul ops over quantized tensors.
+
+All ops route through the canonical `quantize_8bit_linear` / `dequantize_8bit`
+pair so there's one code path, one set of conventions, and no silent
+wrap-around from casting 0-255 values through `torch.int8`.
+
+`quantized_matmul_int8` uses `torch._int_mm` on CUDA for true int8 GEMM
+(int8 × int8 → int32) when inputs are 2-D; falls back to dequant-and-matmul
+otherwise.
+"""
+
+import torch
+
 from .base import BaseQuantizer
-from typing import Tuple
+from .quantization import (
+    quantize_8bit_linear,
+    dequantize_8bit as _dequantize_8bit_legacy,
+)
+
 
 class Quantizer(BaseQuantizer):
-    """Quantization operations using the base quantizer."""
-    
-    def quantize_8bit(
-        self,
-        tensor: torch.Tensor,
-        per_channel: bool = False,
-        symmetric: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """8-bit quantization."""
+    """BaseQuantizer façade with 8-bit and 4-bit convenience entry points."""
+
+    def quantize_8bit(self, tensor, per_channel=False, symmetric=True):
         self.num_bits = 8
         self.symmetric = symmetric
         return self.quantize(tensor, per_channel)
-    
-    def quantize_4bit(
-        self,
-        tensor: torch.Tensor,
-        per_channel: bool = False,
-        symmetric: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """4-bit quantization."""
+
+    def quantize_4bit(self, tensor, per_channel=False, symmetric=True):
         self.num_bits = 4
         self.symmetric = symmetric
         return self.quantize(tensor, per_channel)
 
+
 _quantizer = Quantizer()
+
 
 def quantize_8bit(tensor, per_channel=False, symmetric=True):
     return _quantizer.quantize_8bit(tensor, per_channel, symmetric)
 
+
 def quantize_4bit(tensor, per_channel=False, symmetric=True):
     return _quantizer.quantize_4bit(tensor, per_channel, symmetric)
+
 
 def dequantize_8bit(q_tensor, scale, zero_point):
     return _quantizer.dequantize(q_tensor, scale, zero_point)
 
+
 def dequantize_4bit(q_tensor, scale, zero_point):
     return _quantizer.dequantize(q_tensor, scale, zero_point)
 
-def quantize(tensor , num_bits = 8 , symmetric = True):
-    min_val = tensor.min().item()
-    max_val = tensor.max().item()
 
-    if symmetric:
-        abs_max = max(abs(min_val), abs(max_val))
-        scale = (2**(num_bits-1) - 1) / abs_max
-        zero_point = 0
-    else:
-        scale = (2**num_bits - 1) / (max_val - min_val)
-        zero_point = -round(min_val * scale)
+# -----------------------------------------------------------------------------
+# Single source of truth for linear 8-bit quant inside this module. Delegating
+# to `quantization.quantize_8bit_linear` keeps one implementation.
+# -----------------------------------------------------------------------------
 
-    quantize = torch.clamp(
-        torch.round(tensor * scale + zero_point) , 0 , 2**num_bits - 1).to(torch.int8 if num_bits <= 8 else torch.int16)
-    return quantize , scale , zero_point
+def _quant(tensor):
+    return quantize_8bit_linear(tensor)
 
-def dequantize(tensor , scale , zero_point):
-    return (tensor.float() - zero_point)/scale
+
+def _dequant(q, scale, offset):
+    # Uses the legacy functional dequantizer (which accepts quant_type).
+    # We re-import it under an alias because this module shadows
+    # `dequantize_8bit` with a BaseQuantizer-backed wrapper at line 48.
+    return _dequantize_8bit_legacy(q, scale, offset, quant_type="linear")
+
 
 def quantize_add(a, a_scale, a_zero_point, b, b_scale, b_zero_point):
-    a_float = dequantize(a , a_scale , a_zero_point)
-    b_float = dequantize(b , b_scale , b_zero_point)
+    a_f = _dequant(a, a_scale, a_zero_point)
+    b_f = _dequant(b, b_scale, b_zero_point)
+    return _quant(a_f + b_f)
 
-    result_float = a_float + b_float 
-
-    return quantize(result_float)
 
 def quantized_matmul(a, a_scale, a_zero_point, b, b_scale, b_zero_point):
+    """Dequant-matmul-requant fallback. Always correct, but fp32 compute.
 
-    # Dequantize inputs to floating point
-    a_float = dequantize(a, a_scale, a_zero_point)
-    b_float = dequantize(b, b_scale, b_zero_point)
-    
-    # Perform matrix multiplication in floating point
-    result_float = torch.matmul(a_float, b_float)
-    
-    # Requantize the result
-    return quantize(result_float)
+    Prefer `quantized_matmul_int8` for 2-D int8 × int8 on CUDA.
+    """
+    a_f = _dequant(a, a_scale, a_zero_point)
+    b_f = _dequant(b, b_scale, b_zero_point)
+    return _quant(torch.matmul(a_f, b_f))
+
+
+def quantized_matmul_int8(
+    a_int8: torch.Tensor,
+    b_int8: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+) -> torch.Tensor:
+    """True int8 GEMM using torch._int_mm where available.
+
+    Args:
+        a_int8, b_int8: 2-D int8 tensors in symmetric form (scale = absmax/127).
+        a_scale, b_scale: absmax/127 scales so that `fp = q * scale`.
+
+    Returns a float32 tensor of shape (M, N).
+    """
+    use_int_mm = (
+        a_int8.is_cuda and b_int8.is_cuda
+        and a_int8.dim() == 2 and b_int8.dim() == 2
+        and a_int8.dtype == torch.int8 and b_int8.dtype == torch.int8
+        and hasattr(torch, "_int_mm")
+    )
+    if use_int_mm:
+        acc_i32 = torch._int_mm(a_int8.contiguous(), b_int8.contiguous())
+        return acc_i32.to(torch.float32) * (a_scale * b_scale)
+    # CPU / odd-dtype fallback
+    return (a_int8.float() * a_scale) @ (b_int8.float() * b_scale)
+
 
 def quantized_mul(a, a_scale, a_zero_point, b, b_scale, b_zero_point):
+    a_f = _dequant(a, a_scale, a_zero_point)
+    b_f = _dequant(b, b_scale, b_zero_point)
+    return _quant(a_f * b_f)
 
-    # Dequantize inputs to floating point
-    a_float = dequantize(a, a_scale, a_zero_point)
-    b_float = dequantize(b, b_scale, b_zero_point)
-    
-    # Perform element-wise multiplication in floating point
-    result_float = a_float * b_float
-    
-    # Requantize the result
-    return quantize(result_float)
 
 def quantized_relu(x, scale, zero_point):
-
-    # Dequantize input to floating point
-    x_float = dequantize(x, scale, zero_point)
-    
-    # Apply ReLU in floating point
-    result_float = torch.relu(x_float)
-    
-    # Requantize the result
-    return quantize(result_float)
+    return _quant(torch.relu(_dequant(x, scale, zero_point)))
