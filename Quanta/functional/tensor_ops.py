@@ -11,12 +11,11 @@ otherwise.
 """
 
 import torch
-from typing import Tuple
 
 from .base import BaseQuantizer
 from .quantization import (
     quantize_8bit_linear,
-    dequantize_8bit,
+    dequantize_8bit as _dequantize_8bit_legacy,
 )
 
 
@@ -63,7 +62,10 @@ def _quant(tensor):
 
 
 def _dequant(q, scale, offset):
-    return dequantize_8bit(q, scale, offset, quant_type="linear")
+    # Uses the legacy functional dequantizer (which accepts quant_type).
+    # We re-import it under an alias because this module shadows
+    # `dequantize_8bit` with a BaseQuantizer-backed wrapper at line 48.
+    return _dequantize_8bit_legacy(q, scale, offset, quant_type="linear")
 
 
 def quantize_add(a, a_scale, a_zero_point, b, b_scale, b_zero_point):
