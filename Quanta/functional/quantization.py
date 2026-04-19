@@ -1,30 +1,16 @@
 """
-Quantization and dequantization.
+Quantization and dequantization built around a single ``QuantState`` API.
 
-Two APIs live here side-by-side:
+``quantize(x, scheme=..., block_size=...)`` returns a ``QuantState`` carrying
+all metadata needed to reverse the operation. ``dequantize(state)`` dispatches
+on ``state.scheme``.
 
-1. Legacy functional API — `quantize_8bit`, `quantize_4bit`, `dequantize_*`,
-   plus per-scheme `quantize_8bit_linear`, `quantize_4bit_nf4`, ... — returning
-   a `(q_tensor, scale_or_levels, zero_point_or_bias)` tuple. Kept for
-   backwards compatibility with existing callers and tests.
-
-2. New `QuantState`-based API — `quantize(x, scheme=..., block_size=...)` and
-   `dequantize(state)`. Preferred for new code: carries shape/dtype/block/code
-   metadata in one object and supports blockwise scales and packed 4-bit
-   storage.
-
-Design choices worth calling out:
-
-- nf4/nf8 encoding uses `torch.bucketize` on midpoint edges instead of the old
-  O(N·K) `|x-levels|` distance matrix. Fixes OOMs on large tensors and is
-  dramatically faster.
-- 4-bit data can be stored packed (two nibbles per byte, via `pack_4bit`).
-  Legacy functions keep the unpacked uint8 storage to preserve return-shape
-  contracts; blockwise / QuantState paths use packed storage.
-- fp4 is normalized by `absmax` before encoding — the old implementation
-  clamped raw magnitudes into `[0.5, 4.0]` and had ~0.22 MAE on standard
-  normals; now ~0.07.
-- Level tables are always allocated on `tensor.device` with `tensor.dtype`.
+Notes:
+- nf4/nf8/fp4 use ``torch.bucketize`` over codebook midpoints, not an
+  ``|x - levels|`` distance matrix — O(N log K) and avoids OOMs at scale.
+- 4-bit data is stored packed (two nibbles per byte).
+- fp4 is normalized by per-tensor (or per-block) absmax before encoding.
+- Codebook tensors are always allocated on the input's device and dtype.
 """
 
 from __future__ import annotations
@@ -35,23 +21,15 @@ from typing import Optional, Tuple
 
 import torch
 
-# -----------------------------------------------------------------------------
-# torch.compile hot paths.
-#
-# Gated via QUANTA_DISABLE_COMPILE=1 so users without a compile-capable backend
-# (or who hit a dynamic-shape edge case) can fall back to eager.
-# -----------------------------------------------------------------------------
+
 _COMPILE_ENABLED = (
     hasattr(torch, "compile")
     and os.environ.get("QUANTA_DISABLE_COMPILE", "0") != "1"
 )
-
-# Triton kernel is opt-out the same way.
 _TRITON_ENABLED = os.environ.get("QUANTA_DISABLE_TRITON", "0") != "1"
 
 
 def _maybe_compile(fn):
-    """torch.compile with dynamic=True when available, identity otherwise."""
     if not _COMPILE_ENABLED:
         return fn
     try:
@@ -60,18 +38,15 @@ def _maybe_compile(fn):
         return fn
 
 
-
-_NF4_LEVELS = (
+_NF4_LEVELS: Tuple[float, ...] = (
     -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
     -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
     0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
     0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
 )
 
-# FP4 codebook (bnb-compatible magnitudes, signed via bit 3). 16 entries indexed
-# by the 4-bit value. Using a lookup table gives correct representable values
-# without manual exponent/mantissa arithmetic.
-_FP4_CODE = (
+# bnb-compatible FP4 codebook: 16 signed values addressed by the 4-bit code.
+_FP4_CODE: Tuple[float, ...] = (
     0.0, 0.00520833, 0.66666667, 1.0,
     0.33333333, 0.5, 0.16666667, 0.25,
     -0.0, -0.00520833, -0.66666667, -1.0,
@@ -79,29 +54,24 @@ _FP4_CODE = (
 )
 
 
-def _nf4_levels(device, dtype):
+def _nf4_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.tensor(_NF4_LEVELS, device=device, dtype=dtype)
 
 
-def _nf8_levels(device, dtype):
+def _nf8_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     lvl = torch.linspace(-1.0, 1.0, 256, device=device, dtype=dtype)
     return torch.tanh(lvl * 2)
 
 
-def _fp4_code(device, dtype):
+def _fp4_code(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.tensor(_FP4_CODE, device=device, dtype=dtype)
 
 
 def _codebook_encode(normalized: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
-    """Assign each element the index of its nearest level, using bucketize on
-    midpoint edges. Returns indices into the ORIGINAL (unsorted) codebook."""
     sorted_levels, order = torch.sort(levels)
     edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
     sorted_idx = torch.bucketize(normalized.contiguous(), edges)
-    # sorted_levels[i] == levels[order[i]], so the codebook index
-    # corresponding to sorted-index i is order[i].
     return order[sorted_idx]
-
 
 
 def pack_4bit(q: torch.Tensor) -> torch.Tensor:
@@ -114,7 +84,7 @@ def pack_4bit(q: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_4bit(packed: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-    """Reverse of `pack_4bit`."""
+    """Reverse of ``pack_4bit``."""
     low = packed & 0x0F
     high = (packed >> 4) & 0x0F
     out = torch.stack([low, high], dim=-1).reshape(-1)
@@ -124,23 +94,18 @@ def unpack_4bit(packed: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     return out[:n].reshape(shape)
 
 
-
 @dataclass
 class QuantState:
-    """All metadata needed to undo a `quantize` call.
-
-    Fields are optional to accommodate every scheme. `dequantize(state)`
-    dispatches on `scheme`.
-    """
+    """Everything ``dequantize`` needs to reverse a ``quantize`` call."""
     qdata: torch.Tensor
     scheme: str
     shape: Optional[torch.Size] = None
     dtype: torch.dtype = torch.float32
-    absmax: Optional[torch.Tensor] = None           # per-tensor or per-block
-    offset: Optional[torch.Tensor] = None           # for asymmetric linear
+    absmax: Optional[torch.Tensor] = None
+    offset: Optional[torch.Tensor] = None
     block_size: Optional[int] = None
     packed: bool = False
-    code: Optional[torch.Tensor] = None             # codebook for nf/fp
+    code: Optional[torch.Tensor] = None
 
 
 def _pad_for_blocks(x: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, int]:
@@ -151,7 +116,6 @@ def _pad_for_blocks(x: torch.Tensor, block_size: int) -> Tuple[torch.Tensor, int
     else:
         flat = x.reshape(-1)
     return flat.view(-1, block_size), pad
-
 
 
 def _linear_encode_blockwise_eager(blocks: torch.Tensor, qmax: int):
@@ -167,7 +131,6 @@ def _linear_encode_pertensor_eager(x: torch.Tensor, qmax: int):
 
 
 def _linear_decode_blockwise_eager(q: torch.Tensor, absmax: torch.Tensor, qmax: int):
-    # q: [num_blocks, block_size] int8, absmax: [num_blocks] float32
     return q.float() * (absmax.unsqueeze(-1) / qmax)
 
 
@@ -176,7 +139,6 @@ def _linear_decode_pertensor_eager(q: torch.Tensor, absmax: torch.Tensor, qmax: 
 
 
 def _codebook_decode_eager(idx_long: torch.Tensor, code: torch.Tensor, absmax_mul: torch.Tensor):
-    # idx_long: long-dtype index tensor; absmax_mul broadcastable to idx shape
     return code[idx_long] * absmax_mul
 
 
@@ -187,18 +149,25 @@ _linear_decode_pertensor = _maybe_compile(_linear_decode_pertensor_eager)
 _codebook_decode = _maybe_compile(_codebook_decode_eager)
 
 
+VALID_SCHEMES = ("int8_linear", "int4_linear", "nf4", "nf8", "fp4", "fp8")
+
+
 def quantize(
     x: torch.Tensor,
     scheme: str = "int8_linear",
     block_size: Optional[int] = None,
 ) -> QuantState:
-    """
-    Quantize `x` into a `QuantState`.
+    """Quantize ``x`` into a ``QuantState``.
 
-    scheme:
-      int8_linear, int4_linear   — symmetric absmax linear, optionally blockwise
-      nf4, nf8                   — normalized-float codebook
-      fp4, fp8                   — signed float codebook (fp8 handled analytically)
+    Args:
+        x: Input tensor of any shape and float dtype.
+        scheme: One of ``int8_linear``, ``int4_linear``, ``nf4``, ``nf8``,
+            ``fp4``, ``fp8``.
+        block_size: If set, scales are computed per ``block_size`` consecutive
+            elements (after flattening). Robust to outliers; use 32–256.
+
+    Returns:
+        ``QuantState`` carrying the packed/unpacked qdata and all metadata.
     """
     orig_shape = x.shape
     orig_dtype = x.dtype
@@ -209,7 +178,6 @@ def quantize(
     if scheme == "int4_linear":
         return _quant_linear(x32, bits=4, orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf4":
-        # Fast path: Triton kernel for blockwise nf4 on CUDA (bit-exact to eager).
         if (
             _TRITON_ENABLED
             and block_size is not None
@@ -234,7 +202,7 @@ def quantize(
                         code=_nf4_levels(x.device, torch.float32),
                     )
             except Exception:
-                pass  # fall through to eager
+                pass
         return _quant_codebook(x32, levels=_nf4_levels(x.device, torch.float32), bits=4, scheme="nf4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf8":
@@ -244,16 +212,15 @@ def quantize(
         return _quant_codebook(x32, levels=_fp4_code(x.device, torch.float32), bits=4, scheme="fp4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "fp8":
-        # fp8 is a real 1-4-3 float; keep analytical decode to match prior behavior.
         return _quant_fp8(x32, orig_shape=orig_shape, orig_dtype=orig_dtype)
-    raise ValueError(f"Unknown scheme: {scheme}")
+    raise ValueError(f"Unknown scheme: {scheme!r}. Expected one of {VALID_SCHEMES}.")
 
 
 def dequantize(state: QuantState) -> torch.Tensor:
+    """Reverse a ``quantize`` call. Returns a tensor of ``state.dtype``."""
     if state.scheme in ("int8_linear", "int4_linear"):
         return _dequant_linear(state)
     if state.scheme in ("nf4", "nf8", "fp4"):
-        # Triton fast path for blockwise nf4 on CUDA (bit-exact to eager).
         if (
             _TRITON_ENABLED
             and state.scheme == "nf4"
@@ -273,15 +240,15 @@ def dequantize(state: QuantState) -> torch.Tensor:
                     )
                     return out.to(state.dtype)
             except Exception:
-                pass  # fall through
+                pass
         return _dequant_codebook(state)
     if state.scheme == "fp8":
         return _dequant_fp8(state)
-    raise ValueError(f"Unknown scheme: {state.scheme}")
+    raise ValueError(f"Unknown scheme: {state.scheme!r}. Expected one of {VALID_SCHEMES}.")
 
 
 def _quant_linear(x, *, bits, orig_shape, orig_dtype, block_size):
-    qmax = (1 << (bits - 1)) - 1  # 127 for int8, 7 for int4
+    qmax = (1 << (bits - 1)) - 1
     if block_size:
         blocks, pad = _pad_for_blocks(x, block_size)
         q, absmax = _linear_encode_blockwise(blocks, qmax)
@@ -298,7 +265,6 @@ def _quant_linear(x, *, bits, orig_shape, orig_dtype, block_size):
             block_size=block_size,
             packed=(bits == 4),
         )
-    # per-tensor
     q, absmax = _linear_encode_pertensor(x, qmax)
     qdata = q.reshape(orig_shape)
     return QuantState(
@@ -314,7 +280,6 @@ def _quant_linear(x, *, bits, orig_shape, orig_dtype, block_size):
 
 def _maybe_pack(q_int8: torch.Tensor, bits: int) -> torch.Tensor:
     if bits == 4:
-        # shift signed [-7,7] -> unsigned [0,14] then pack
         u = (q_int8 + 7).to(torch.uint8)
         return pack_4bit(u)
     return q_int8
@@ -342,7 +307,6 @@ def _dequant_linear(state: QuantState) -> torch.Tensor:
             out = out[:out.numel() - pad]
         return out.reshape(state.shape).to(state.dtype)
     return _linear_decode_pertensor(q, state.absmax, qmax).reshape(state.shape).to(state.dtype)
-
 
 
 def _quant_codebook(x, *, levels, bits, scheme, orig_shape, orig_dtype, block_size):
@@ -405,10 +369,9 @@ def _dequant_codebook(state: QuantState) -> torch.Tensor:
     return _codebook_decode(idx, state.code, state.absmax).reshape(state.shape).to(state.dtype)
 
 
-
 def _quant_fp8(x, *, orig_shape, orig_dtype):
-    # Same scheme as before: 1 sign, 4 exponent, 3 mantissa, bias 7. Kept
-    # analytical so the 256-bucket storage remains compact.
+    # 1 sign / 4 exponent / 3 mantissa, bias 7. Analytical encode keeps the
+    # storage at one byte per value without a 256-entry LUT.
     signs = torch.sign(x)
     abs_values = torch.abs(x)
     log_values = torch.log2(abs_values + (abs_values == 0).float())
@@ -426,7 +389,7 @@ def _quant_fp8(x, *, orig_shape, orig_dtype):
         scheme="fp8",
         shape=orig_shape,
         dtype=orig_dtype,
-        absmax=torch.tensor(float(exp_bias)),  # re-use slot for bias
+        absmax=torch.tensor(float(exp_bias)),
     )
 
 
@@ -438,139 +401,3 @@ def _dequant_fp8(state: QuantState) -> torch.Tensor:
     mantissa_values = q & 0x07
     values = (1.0 + mantissa_values.float() / 8.0) * (2.0 ** (exp_values.float() - bias))
     return (values * signs).to(state.dtype)
-
-
-def quantize_4bit(tensor, quant_type="linear", per_channel=False):
-    if quant_type == "linear":
-        return quantize_4bit_linear(tensor, per_channel)
-    if quant_type == "nf4":
-        return quantize_4bit_nf4(tensor)
-    if quant_type == "fp4":
-        return quantize_4bit_fp4(tensor)
-    raise ValueError(f"Unknown quantization type: {quant_type}")
-
-
-def quantize_8bit(tensor, quant_type="linear", per_channel=False):
-    if quant_type == "linear":
-        return quantize_8bit_linear(tensor, per_channel)
-    if quant_type == "nf8":
-        return quantize_8bit_nf8(tensor)
-    if quant_type == "fp8":
-        return quantize_8bit_fp8(tensor)
-    raise ValueError(f"Unknown quantization type: {quant_type}")
-
-
-def dequantize_8bit(q_tensor, scale_or_levels, zero_point_or_bias, quant_type="linear"):
-    if quant_type == "linear":
-        return q_tensor.float() * scale_or_levels + zero_point_or_bias
-    if quant_type == "nf8":
-        return scale_or_levels[q_tensor.long()] * zero_point_or_bias
-    if quant_type == "fp8":
-        q = q_tensor.to(torch.uint8)
-        signs = torch.where(q & 0x80 > 0, -1.0, 1.0)
-        exp_values = (q >> 3) & 0x0F
-        mantissa_values = q & 0x07
-        bias = float(zero_point_or_bias) if not isinstance(zero_point_or_bias, torch.Tensor) else float(zero_point_or_bias.item())
-        values = (1.0 + mantissa_values.float() / 8.0) * (2.0 ** (exp_values.float() - bias))
-        return values * signs
-    raise ValueError(f"Unknown quantization type: {quant_type}")
-
-
-def dequantize_4bit(q_tensor, scale_or_levels, zero_point_or_bias, quant_type="linear"):
-    if quant_type == "linear":
-        return q_tensor.float() * scale_or_levels + zero_point_or_bias
-    if quant_type == "nf4":
-        return scale_or_levels[q_tensor.long()] * zero_point_or_bias
-    if quant_type == "fp4":
-        # zero_point_or_bias is the absmax (post-fix); scale_or_levels is the codebook
-        code = scale_or_levels if isinstance(scale_or_levels, torch.Tensor) else _fp4_code(q_tensor.device, torch.float32)
-        idx = q_tensor.to(torch.long)
-        absmax = zero_point_or_bias
-        return code[idx] * absmax
-    raise ValueError(f"Unknown quantization type: {quant_type}")
-
-
-def quantize_4bit_linear(tensor, per_channel=False):
-    """Linear 4-bit quantization with 16 levels (0-15). Legacy unsigned form."""
-    if per_channel:
-        dim = 0 if tensor.dim() > 1 else None
-        min_val = tensor.min(dim=dim, keepdim=True).values
-        max_val = tensor.max(dim=dim, keepdim=True).values
-        mask = (max_val == min_val)
-        max_val = torch.where(mask, min_val + 1e-6, max_val)
-    else:
-        min_val = tensor.min()
-        max_val = tensor.max()
-        if max_val == min_val:
-            max_val = min_val + 1e-6
-    scale = (max_val - min_val) / 15
-    offset = min_val
-    q = torch.clamp(torch.round((tensor - min_val) / scale), 0, 15).to(torch.uint8)
-    return q, scale, offset
-
-
-def quantize_4bit_nf4(tensor):
-    """NF4 quantization — now uses bucketize, no O(N·K) blowup."""
-    levels = _nf4_levels(tensor.device, tensor.dtype)
-    abs_max = tensor.abs().amax().clamp(min=1e-8)
-    normalized = (tensor / abs_max).clamp(levels.min(), levels.max())
-    idx = _codebook_encode(normalized, levels).to(torch.uint8)
-    return idx, levels, abs_max
-
-
-def quantize_4bit_fp4(tensor):
-    """FP4 via codebook lookup with per-tensor absmax normalization.
-
-    Returns `(idx_u8, code, absmax)` — dequant is `code[idx] * absmax`. Note
-    that the second return is now the FP4 codebook (a tensor), not None.
-    """
-    code = _fp4_code(tensor.device, tensor.dtype)
-    abs_max = tensor.abs().amax().clamp(min=1e-8)
-    normalized = (tensor / abs_max).clamp(code.min(), code.max())
-    idx = _codebook_encode(normalized, code).to(torch.uint8)
-    return idx, code, abs_max
-
-
-def quantize_8bit_fp8(tensor):
-    """Legacy fp8 analytical encoder. Unchanged except for the .bool() mask fix."""
-    signs = torch.sign(tensor)
-    abs_values = torch.abs(tensor)
-    log_values = torch.log2(abs_values + (abs_values == 0).float())
-    exp_bias = 7
-    exp_values = torch.clamp(torch.round(log_values + exp_bias), 0, 15)
-    mantissa_values = torch.round((abs_values / (2 ** (exp_values - exp_bias))) * 8 - 8)
-    mantissa_values = torch.clamp(mantissa_values, 0, 7)
-    exp_values = exp_values.to(torch.uint8)
-    mantissa_values = mantissa_values.to(torch.uint8)
-    q = ((exp_values << 3) | mantissa_values).to(torch.uint8)
-    signs_u = (signs < 0).to(torch.bool)
-    q = torch.where(signs_u, q | 0x80, q)
-    return q, None, exp_bias
-
-
-def quantize_8bit_nf8(tensor):
-    """NF8 quantization — uses bucketize (no 256× tensor blowup)."""
-    levels = _nf8_levels(tensor.device, tensor.dtype)
-    abs_max = tensor.abs().amax().clamp(min=1e-8)
-    normalized = (tensor / abs_max).clamp(levels.min(), levels.max())
-    idx = _codebook_encode(normalized, levels).to(torch.uint8)
-    return idx, levels, abs_max
-
-
-def quantize_8bit_linear(tensor, per_channel=False):
-    """Linear 8-bit, unsigned offset form. Legacy."""
-    if per_channel:
-        dim = 0 if tensor.dim() > 1 else None
-        min_val = tensor.min(dim=dim, keepdim=True).values
-        max_val = tensor.max(dim=dim, keepdim=True).values
-        mask = (max_val == min_val)
-        max_val = torch.where(mask, min_val + 1e-6, max_val)
-    else:
-        min_val = tensor.min()
-        max_val = tensor.max()
-        if max_val == min_val:
-            max_val = min_val + 1e-6
-    scale = (max_val - min_val) / 255
-    offset = min_val
-    q = torch.clamp(torch.round((tensor - min_val) / scale), 0, 255).to(torch.uint8)
-    return q, scale, offset

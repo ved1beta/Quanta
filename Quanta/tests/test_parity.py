@@ -1,34 +1,25 @@
-"""
-Device parity + QuantState round-trip tests.
+"""Device parity + numerical-quality tests for the QuantState API.
 
-Every quantization scheme is exercised on every available device to catch the
-class of bug where a codebook or constant tensor lands on the wrong device.
+Every scheme is exercised on every available device. Tolerances are
+round-trip MAE ceilings on a standard normal — exceeding them indicates a
+regression.
 """
 
 import pytest
 import torch
 
-from Quanta.functional.quantization import (
+from Quanta.functional import (
     QuantState,
-    quantize,
     dequantize,
-    quantize_8bit,
-    dequantize_8bit,
-    quantize_4bit,
-    dequantize_4bit,
-    pack_4bit,
-    unpack_4bit,
+    quantize,
 )
 
-DEVICES = ["cpu"]
-if torch.cuda.is_available():
-    DEVICES.append("cuda")
+
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 SCHEMES_8BIT = ["int8_linear", "nf8", "fp8"]
 SCHEMES_4BIT = ["int4_linear", "nf4", "fp4"]
 
-# Tolerance per scheme, per-tensor (no blockwise). These are round-trip MAE
-# ceilings on a standard normal; exceeding these indicates a regression.
 TOL_PER_TENSOR = {
     "int8_linear": 0.02,
     "nf8":         0.03,
@@ -38,11 +29,9 @@ TOL_PER_TENSOR = {
     "fp4":         0.25,
 }
 
-# Blockwise tolerances are tighter
 TOL_BLOCK = {
     "int8_linear": 0.01,
     "nf8":         0.02,
-    "fp8":         0.15,   # fp8 legacy path, no blockwise variant
     "int4_linear": 0.15,
     "nf4":         0.10,
     "fp4":         0.15,
@@ -65,7 +54,7 @@ def test_quantstate_roundtrip(device, scheme):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("scheme", ["int8_linear", "nf8", "int4_linear", "nf4", "fp4"])
+@pytest.mark.parametrize("scheme", list(TOL_BLOCK))
 def test_quantstate_blockwise(device, scheme):
     torch.manual_seed(0)
     x = torch.randn(512, 512, device=device)
@@ -76,66 +65,19 @@ def test_quantstate_blockwise(device, scheme):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("quant_type", ["linear", "nf8", "fp8"])
-def test_legacy_8bit(device, quant_type):
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, device=device)
-    q, a, b = quantize_8bit(x, quant_type=quant_type)
-    assert q.device.type == device
-    d = dequantize_8bit(q, a, b, quant_type=quant_type)
-    assert d.shape == x.shape
-    # loose bound — just ensure it doesn't blow up
-    assert (x - d).abs().mean().item() < 0.15
-
-
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("quant_type", ["linear", "nf4", "fp4"])
-def test_legacy_4bit(device, quant_type):
-    torch.manual_seed(0)
-    x = torch.randn(256, 256, device=device)
-    q, a, b = quantize_4bit(x, quant_type=quant_type)
-    assert q.device.type == device
-    d = dequantize_4bit(q, a, b, quant_type=quant_type)
-    assert d.shape == x.shape
-    assert (x - d).abs().mean().item() < 0.25
-
-
-@pytest.mark.parametrize("device", DEVICES)
-def test_4bit_packing_roundtrip(device):
-    torch.manual_seed(0)
-    # values in [0, 15]
-    raw = torch.randint(0, 16, (1024,), device=device, dtype=torch.uint8)
-    packed = pack_4bit(raw)
-    assert packed.numel() == raw.numel() // 2
-    assert packed.dtype == torch.uint8
-    unpacked = unpack_4bit(packed, raw.shape)
-    assert torch.equal(unpacked, raw)
-
-
-@pytest.mark.parametrize("device", DEVICES)
-def test_4bit_packing_odd_length(device):
-    raw = torch.randint(0, 16, (1023,), device=device, dtype=torch.uint8)
-    packed = pack_4bit(raw)
-    unpacked = unpack_4bit(packed, raw.shape)
-    assert torch.equal(unpacked, raw)
-
-
-@pytest.mark.parametrize("device", DEVICES)
 def test_packed_size_vs_unpacked(device):
-    """int4_linear via QuantState should be ~2x smaller than int8_linear."""
+    """int4_linear packs 2 nibbles per byte → ~2× smaller than int8_linear."""
     x = torch.randn(1024, 1024, device=device)
     s8 = quantize(x, scheme="int8_linear")
     s4 = quantize(x, scheme="int4_linear")
-    assert s4.qdata.numel() == s8.qdata.numel() // 2, (s4.qdata.numel(), s8.qdata.numel())
+    assert s4.qdata.numel() == s8.qdata.numel() // 2
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_blockwise_beats_per_tensor_mae(device):
-    """Blockwise should always match or beat per-tensor MAE — that's the point."""
+def test_blockwise_beats_per_tensor_under_outlier(device):
     torch.manual_seed(0)
     x = torch.randn(4096, device=device)
-    # inject an outlier so per-tensor absmax is dominated by it
-    x[0] = 100.0
+    x[0] = 100.0  # outlier dominates per-tensor absmax
     flat_st = quantize(x, scheme="int8_linear")
     block_st = quantize(x, scheme="int8_linear", block_size=64)
     mae_flat = (x - dequantize(flat_st)).abs().mean().item()
@@ -145,17 +87,16 @@ def test_blockwise_beats_per_tensor_mae(device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="int_mm requires CUDA")
 def test_int8_matmul_via_int_mm():
-    from Quanta.functional.tensor_ops import quantized_matmul_int8
+    from Quanta.functional import quantized_matmul_int8
+
     torch.manual_seed(0)
     a = torch.randn(128, 256, device="cuda")
     b = torch.randn(256, 64, device="cuda")
-    # symmetric quantize both to int8
     a_scale = a.abs().amax() / 127
     b_scale = b.abs().amax() / 127
     a_q = torch.round(a / a_scale).clamp(-127, 127).to(torch.int8)
     b_q = torch.round(b / b_scale).clamp(-127, 127).to(torch.int8)
     out = quantized_matmul_int8(a_q, b_q, a_scale, b_scale)
     expected = a @ b
-    mae = (out - expected).abs().mean().item()
-    rel = mae / expected.abs().mean().item()
+    rel = (out - expected).abs().mean().item() / expected.abs().mean().item()
     assert rel < 0.02, f"int8 matmul relative error {rel}"

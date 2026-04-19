@@ -1,17 +1,31 @@
-"""
-Bits-and-Byes: A library for efficient quantization and memory optimization in PyTorch.
-"""
+"""Quanta — efficient quantization primitives for PyTorch."""
 
-__version__ = "0.1.0"
-
-from . import nn
-from . import optim
-from . import functional
-
-# Import commonly used functions directly into the main namespace
-from .nn import Linear8bitLt, Linear4bit
-from .optim import Adam8bit
-
-# Set up logging
 import logging
-logging.getLogger(__name__).addHandler(logging.NullHandler()) 
+
+from . import functional, nn
+from .functional import (
+    QuantState,
+    VALID_SCHEMES,
+    dequantize,
+    quantize,
+    quantized_matmul,
+    quantized_matmul_int8,
+)
+from .nn import Linear4bit, Linear8bitLt
+
+__version__ = "0.2.0"
+
+__all__ = [
+    "QuantState",
+    "VALID_SCHEMES",
+    "quantize",
+    "dequantize",
+    "quantized_matmul",
+    "quantized_matmul_int8",
+    "Linear8bitLt",
+    "Linear4bit",
+    "functional",
+    "nn",
+]
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
