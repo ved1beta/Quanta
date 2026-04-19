@@ -1,18 +1,16 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "numpy>=1.20.0", "torch>=2.2.0"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "bits-and-byes"
+name = "quanta"
 version = "0.1.0"
-description = "A library for efficient quantization and memory optimization in PyTorch"
+description = "Efficient quantization and memory optimization primitives for PyTorch"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {file = "LICENSE"}
-authors = [
-    {name = "Bits-and-Byes Contributors", email = "your-email@example.com"}
-]
-keywords = ["machine-learning", "pytorch", "quantization", "llm", "qlora"]
+license = { file = "LICENSE" }
+authors = [{ name = "Quanta Contributors" }]
+keywords = ["pytorch", "quantization", "nf4", "int8", "llm", "qlora"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -21,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -28,46 +27,34 @@ dependencies = [
     "numpy>=1.20.0",
 ]
 
-[project.urls]
-"Homepage" = "https://github.com/yourusername/bits-and-byes"
-"Bug Tracker" = "https://github.com/yourusername/bits-and-byes/issues"
-"Documentation" = "https://bits-and-byes.readthedocs.io/"
-
 [project.optional-dependencies]
+triton = ["triton>=2.2.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "black",
     "isort",
-    "flake8",
-    "mypy",
-    "pre-commit",
+    "ruff",
 ]
-docs = [
-    "sphinx",
-    "sphinx-rtd-theme",
-    "myst-parser",
+bench = [
+    "bitsandbytes",
+    "matplotlib",
+    "seaborn",
+    "pandas",
 ]
+
+[tool.setuptools.packages.find]
+include = ["Quanta*"]
+exclude = ["example*", "tests*"]
 
 [tool.black]
 line-length = 100
-target-version = ["py39", "py310", "py311"]
+target-version = ["py39", "py310", "py311", "py312"]
 
 [tool.isort]
 profile = "black"
 line_length = 100
 
-[tool.mypy]
-python_version = "3.9"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-
-[[tool.mypy.overrides]]
-module = ["torch.*"]
-ignore_missing_imports = true
-
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = "test_*.py" 
+testpaths = ["Quanta/tests"]
+python_files = "test_*.py"

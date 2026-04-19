@@ -1,15 +1,15 @@
-import torch
 from typing import Tuple
+
+import torch
 
 
 class BaseQuantizer:
-    """Minimal quantizer used by `tensor_ops.Quantizer`.
+    """Reference quantizer used by ``tensor_ops.Quantizer``.
 
-    Scale convention is inverse-scale (`scale = qmax / absmax` for symmetric,
-    `scale = (2^b - 1) / (max - min)` for asymmetric), so `dequantize` divides
-    by scale. This matches the original module; the functional API in
-    `quantization.py` uses the bnb-style `fp = q * absmax/qmax` convention
-    instead. Don't mix them.
+    Scale convention is inverse-scale (``scale = qmax / absmax`` symmetric;
+    ``scale = (2^b - 1) / (max - min)`` asymmetric), so ``dequantize`` divides
+    by scale. The functional API in ``quantization.py`` uses the bnb-style
+    ``fp = q * absmax/qmax`` convention — don't mix them.
     """
 
     def __init__(self, num_bits: int = 8, symmetric: bool = True):
@@ -22,7 +22,6 @@ class BaseQuantizer:
         tensor: torch.Tensor,
         per_channel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if per_channel:
             dim = 0 if tensor.dim() > 1 else None
             min_val = tensor.min(dim=dim, keepdim=True).values
@@ -43,38 +42,41 @@ class BaseQuantizer:
             zero_point = min_val
 
         return scale, zero_point
-    
-    def quantize(self, 
-                tensor: torch.Tensor,
-                per_channel: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def quantize(
+        self,
+        tensor: torch.Tensor,
+        per_channel: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
         scale, zero_point = self._compute_scale_zero_point(tensor, per_channel)
-        
+
         if self.symmetric:
             q_tensor = torch.clamp(
                 torch.round(tensor * scale),
-                -self.max_val, self.max_val
+                -self.max_val, self.max_val,
             ).to(torch.int8)
-            q_tensor = (q_tensor + 2**(self.num_bits-1)).to(torch.uint8)
+            q_tensor = (q_tensor + 2 ** (self.num_bits - 1)).to(torch.uint8)
         else:
             q_tensor = torch.clamp(
                 torch.round((tensor - zero_point) * scale),
-                0, 2**self.num_bits - 1
+                0, 2 ** self.num_bits - 1,
             ).to(torch.uint8)
 
         return q_tensor, scale, zero_point
-    
-    def dequantize(self, 
-                  q_tensor: torch.Tensor, 
-                  scale: torch.Tensor, 
-                  zero_point: torch.Tensor) -> torch.Tensor:
+
+    def dequantize(
+        self,
+        q_tensor: torch.Tensor,
+        scale: torch.Tensor,
+        zero_point: torch.Tensor,
+    ) -> torch.Tensor:
         if not q_tensor.is_contiguous():
             q_tensor = q_tensor.contiguous()
 
         if self.symmetric:
-            q_tensor = q_tensor.to(torch.int8) - 2**(self.num_bits-1)
+            q_tensor = q_tensor.to(torch.int8) - 2 ** (self.num_bits - 1)
             return q_tensor.float() / scale
-        else:
-            return q_tensor.float() / scale + zero_point
+        return q_tensor.float() / scale + zero_point

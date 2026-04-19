@@ -1,24 +1,9 @@
-"""
-Quantized linear layers.
+"""Quantized linear layers.
 
-Both layers keep fp32 master weights in `self.weight` until `.quantize_weight()`
-is called. After that, the quantized tensors (`qdata`, `absmax`, optional
-`code`) live on the module as **buffers** so they move with `.to(device)` and
-round-trip through `state_dict()` / `load_state_dict()`. Scheme metadata
-(block_size, scheme name, packed flag, original shape/dtype) is carried via
-`get_extra_state` / `set_extra_state`.
-
-Forward path:
-
-- `Linear8bitLt`: currently dequantizes the weight and calls `F.linear`. A
-  true int8 × int8 GEMM via `torch._int_mm` requires reshaping our 1-D
-  blockwise scales into a layout that's compatible with the 2-D reduction
-  (scale must factor across the reduction dim). That's a separate project;
-  see `Quanta.functional.tensor_ops.quantized_matmul_int8` for the
-  per-tensor version.
-- `Linear4bit`: unpacks + dequantizes the weight to `compute_dtype` and runs
-  a normal F.linear — representative of how bnb's 4-bit kernels look from
-  Python land (they fuse the unpack into a custom kernel).
+Master weights live in ``self.weight`` until ``.quantize_weight()`` is called;
+after that, the quantized tensors (``qdata``, ``absmax``, optional ``code``)
+are attached to the module and travel with ``state_dict()``. Scheme metadata
+rides along via ``get_extra_state`` / ``set_extra_state``.
 """
 
 import math
@@ -28,35 +13,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Quanta.functional.quantization import (
-    QuantState,
-    quantize,
-    dequantize,
-)
-
+from Quanta.functional.quantization import QuantState, dequantize, quantize
 
 _VALID_4BIT_SCHEMES = {"nf4", "fp4", "int4_linear"}
-
-
 _Q_TENSOR_NAMES = ("qdata", "absmax", "code")
 _Q_META_KEYS = ("q_scheme", "q_block_size", "q_packed", "q_shape", "q_dtype")
 
 
 class _QuantizedLinearMixin:
-    """Shared state_dict persistence + qstate reconstruction helpers.
-
-    Quantized tensors (`qdata`, `absmax`, optional `code`) are persisted via
-    a custom `_save_to_state_dict` / `_load_from_state_dict` pair so they
-    round-trip cleanly even when loading into a fresh module that hasn't yet
-    registered them as buffers. Scheme metadata (block_size, scheme name,
-    packed flag, shape, dtype) rides along via `get_extra_state`.
-    """
+    """Shared state_dict persistence + qstate reconstruction."""
 
     def _store_qstate(self, state: QuantState):
-        """Attach `state`'s tensors + metadata to the module."""
         self.qdata = state.qdata
         self.absmax = state.absmax
-        self.code = state.code  # may be None for linear schemes
+        self.code = state.code
 
         self._q_scheme = state.scheme
         self._q_block_size = state.block_size
@@ -64,16 +34,14 @@ class _QuantizedLinearMixin:
         self._q_shape = tuple(state.shape) if state.shape is not None else None
         self._q_dtype = state.dtype
 
-        # Free the fp32 master weight. Leave an empty Parameter so `self.weight`
-        # still exists (consumers may introspect it) but occupies no memory.
+        # Free the fp32 master weight but keep `self.weight` as an empty
+        # Parameter so external code introspecting it doesn't blow up.
         self.weight = nn.Parameter(
             torch.empty(0, device=state.qdata.device, dtype=self._q_dtype),
             requires_grad=False,
         )
 
     def _qstate(self) -> Optional[QuantState]:
-        """Rebuild a `QuantState` from the stored tensors, or None if the
-        module hasn't been quantized."""
         if not getattr(self, "_q_scheme", None):
             return None
         return QuantState(
@@ -99,15 +67,14 @@ class _QuantizedLinearMixin:
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
-        # Pop quantized tensors before super() runs so it doesn't treat them as
-        # unexpected. Assign them directly onto the module.
+        # Pop quantized tensors before super() so they aren't flagged unexpected.
         for name in _Q_TENSOR_NAMES:
             key = prefix + name
             if key in state_dict:
                 setattr(self, name, state_dict.pop(key))
 
-        # If the checkpoint holds a zero-sized `weight`, shrink our Parameter to
-        # match so super's loader doesn't raise a size-mismatch error.
+        # If the checkpoint weight is empty, shrink our Parameter so the
+        # default loader doesn't raise a size-mismatch error.
         wkey = prefix + "weight"
         if (
             wkey in state_dict
@@ -143,20 +110,12 @@ class _QuantizedLinearMixin:
 class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
     """int8 linear with blockwise-quantized weight.
 
-    Usage:
-        >>> layer = Linear8bitLt(1024, 4096)
-        >>> layer.weight.data = fp32_weight              # or train
-        >>> layer.quantize_weight(block_size=64)
-        >>> y = layer(x)                                 # forward dequantizes weight
+    Forward currently dequantizes the weight and calls ``F.linear``; true
+    int8×int8 GEMM is exposed separately via
+    ``Quanta.functional.quantized_matmul_int8``.
     """
 
-    def __init__(
-        self,
-        in_features,
-        out_features,
-        bias=True,
-        block_size=64,
-    ):
+    def __init__(self, in_features, out_features, bias=True, block_size=64):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -194,15 +153,9 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
 
 
 class Linear4bit(_QuantizedLinearMixin, nn.Module):
-    """4-bit linear with packed blockwise-quantized weight.
+    """4-bit linear with packed blockwise-quantized weight (~8× fp32).
 
-    Storage footprint per weight is (N/2) bytes + (num_blocks * 4) bytes for
-    scales — ~8× smaller than fp32 master weights with block_size=64.
-
-    `compute_dtype` is the dtype used to materialize the dequantized weight
-    and compute the matmul in. Cast of `bias` into `compute_dtype` is done
-    once at `quantize_weight()` time and cached as a buffer so forward
-    doesn't reallocate on every call.
+    ``compute_dtype`` is the dtype the dequantized weight and matmul run in.
     """
 
     def __init__(
@@ -232,8 +185,7 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        # Populated by quantize_weight() when bias is present; avoids
-        # per-forward bias.to(compute_dtype) allocations.
+        # Cached at quantize_weight() time so forward doesn't reallocate.
         self.register_buffer("_bias_compute", None, persistent=False)
 
         self._q_scheme = None

@@ -1,13 +1,8 @@
-"""
-Triton nf4 blockwise encoder.
+"""Triton NF4 blockwise encode + decode.
 
 Fuses per-block absmax reduction, normalization, nearest-level search, and
-4-bit packing into a single CUDA kernel. One program instance per
-block_size-element block.
-
-Matches the numerics of `quantization._quant_codebook` + `pack_4bit` for
-nf4 with blockwise scales. The eager path's MAE on a standard normal at
-block_size=64 is 0.0728 — this kernel hits the same number bit-for-bit.
+4-bit packing into one kernel. Bit-exact with the eager path in
+``quantization._quant_codebook`` + ``pack_4bit``.
 """
 
 from __future__ import annotations
@@ -22,10 +17,7 @@ except ImportError:
     _TRITON_OK = False
 
 
-# NF4 codebook is already sorted ascending, so the bucket index equals the
-# codebook index directly. Midpoints between adjacent levels = 15 edges.
-# Midpoints of adjacent NF4 levels. Computed directly from _NF4_LEVELS so the
-# kernel matches `torch.bucketize` on the same edges bit-for-bit.
+# Midpoints between adjacent NF4 levels — bucketize edges. 15 edges for 16 levels.
 _NF4_EDGES = (
     -0.8480964004993439,
     -0.6106329262256622,
@@ -50,8 +42,7 @@ if _TRITON_OK:
     @triton.jit
     def _encode_nibbles(xn, E0, E1, E2, E3, E4, E5, E6, E7,
                         E8, E9, E10, E11, E12, E13, E14):
-        # Strict > to match torch.bucketize default (right=False) semantics:
-        # v == edge[i] goes to bucket i, not i+1.
+        # Strict > matches torch.bucketize(right=False): v == edge[i] → bucket i.
         idx = (xn > E0).to(tl.int32)
         idx += (xn > E1).to(tl.int32)
         idx += (xn > E2).to(tl.int32)
@@ -71,12 +62,8 @@ if _TRITON_OK:
 
     @triton.jit
     def _nf4_blockwise_kernel(
-        x_ptr,          # *fp32, [n_padded]
-        absmax_ptr,     # *fp32, [num_blocks]
-        packed_ptr,     # *uint8, [n_padded / 2]
-        n_padded,
-        BLOCK: tl.constexpr,       # quantization block_size, must be even
-        HALF: tl.constexpr,        # BLOCK // 2
+        x_ptr, absmax_ptr, packed_ptr, n_padded,
+        BLOCK: tl.constexpr, HALF: tl.constexpr,
         E0: tl.constexpr, E1: tl.constexpr, E2: tl.constexpr, E3: tl.constexpr,
         E4: tl.constexpr, E5: tl.constexpr, E6: tl.constexpr, E7: tl.constexpr,
         E8: tl.constexpr, E9: tl.constexpr, E10: tl.constexpr, E11: tl.constexpr,
@@ -84,15 +71,12 @@ if _TRITON_OK:
     ):
         pid = tl.program_id(0)
 
-        # Pass 1: load full block to get absmax.
         full_off = pid * BLOCK + tl.arange(0, BLOCK)
         full_mask = full_off < n_padded
         x_full = tl.load(x_ptr + full_off, mask=full_mask, other=0.0)
         absmax = tl.maximum(tl.max(tl.abs(x_full), axis=0), 1e-8)
         tl.store(absmax_ptr + pid, absmax)
 
-        # Pass 2: strided loads of even- and odd-indexed elements,
-        # encode each to a nibble, fuse into a byte.
         pair_arange = tl.arange(0, HALF)
         even_off = pid * BLOCK + pair_arange * 2
         odd_off = even_off + 1
@@ -123,13 +107,8 @@ if _TRITON_OK:
 
     @triton.jit
     def _nf4_dequant_blockwise_kernel(
-        packed_ptr,         # *uint8, [n_padded // 2]
-        absmax_ptr,         # *fp32, [num_blocks]
-        code_ptr,           # *fp32, [16] — NF4 codebook
-        out_ptr,            # *fp32, [n_elements]
-        n_elements,
-        BLOCK: tl.constexpr,   # must match encode block_size
-        HALF: tl.constexpr,    # BLOCK // 2
+        packed_ptr, absmax_ptr, code_ptr, out_ptr, n_elements,
+        BLOCK: tl.constexpr, HALF: tl.constexpr,
     ):
         pid = tl.program_id(0)
         absmax = tl.load(absmax_ptr + pid)
@@ -146,8 +125,6 @@ if _TRITON_OK:
         low = (packed & 0xF).to(tl.int32)
         high = ((packed >> 4) & 0xF).to(tl.int32)
 
-        # Gather from 16-entry codebook. Triton lowers this to a shared/L1-cached
-        # indirect load; for a 16-entry table this is ~free.
         low_val = tl.load(code_ptr + low) * absmax
         high_val = tl.load(code_ptr + high) * absmax
 
@@ -160,12 +137,9 @@ def triton_available() -> bool:
 
 
 def nf4_encode_blockwise_triton(x: torch.Tensor, block_size: int = 64):
-    """Blockwise NF4 encode using the Triton kernel.
+    """Blockwise NF4 encode. Returns ``(packed_u8, absmax_fp32, n_elements)``.
 
-    Returns (packed_u8, absmax_fp32, n_elements_original).
-
-    Requires CUDA. Raises if the input is not on CUDA or block_size isn't
-    a multiple of 2.
+    Requires CUDA and even ``block_size``.
     """
     if not triton_available():
         raise RuntimeError("Triton / CUDA not available")
@@ -206,11 +180,7 @@ def nf4_decode_blockwise_triton(
     shape: torch.Size,
     block_size: int = 64,
 ) -> torch.Tensor:
-    """Blockwise NF4 dequant using the fused Triton kernel.
-
-    Loads packed bytes, splits into nibbles, gathers the codebook value, scales
-    by per-block absmax, and writes fp32 output — all in one kernel launch.
-    """
+    """Blockwise NF4 dequant: unpack, codebook gather, scale — in one launch."""
     if not triton_available():
         raise RuntimeError("Triton / CUDA not available")
     if not packed.is_cuda:
