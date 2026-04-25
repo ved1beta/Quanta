@@ -1,6 +1,6 @@
 # Quanta
 
-Lightweight quantization primitives for PyTorch — int8 / int4 / NF4 / FP4 / NF8 / FP8 in one consistent API, with a Triton NF4 kernel and `torch._int_mm` integration on CUDA.
+Lightweight quantization primitives for PyTorch — int8 / int4 / NF4 / FP4 / NF8 / FP8 in one consistent API, with Triton kernels for NF4/FP4 encode-decode and fused 4-bit weight matmul, plus `torch._int_mm` integration for int8 Linear on CUDA.
 
 ## Install
 
@@ -31,21 +31,21 @@ Schemes: `int8_linear`, `int4_linear`, `nf4`, `nf8`, `fp4`, `fp8`. Pass `block_s
 
 ## Benchmarks
 
-`example/benchmarks.py` measures Quanta against bitsandbytes for quantize/dequantize latency, round-trip MAE, and bytes per element. Below: RTX 3050 6GB at `block_size=64`, weight matrix 4096 × 11008 (~45 M elements).
+`benchmarks/bench_vs_bnb.py` measures Quanta against bitsandbytes for quantize/dequantize latency, round-trip MAE, Linear forward latency, scaling with matrix size, and storage footprint. RTX 3050 6GB at `block_size=64`, weight matrix 4096 × 11008 (~45 M elements).
 
-| Scheme       | Impl   | Quantize (µs) | Dequantize (µs) | MAE       | Bytes/elem |
-|--------------|--------|---------------|-----------------|-----------|------------|
-| int8_linear  | Quanta | **2,470**     | **1,467**       | **0.0050**| 1.062      |
-| int8_linear  | bnb    | 3,639         | 1,465           | 0.0075    | 1.062      |
-| nf4          | Quanta | 5,547         | 1,973           | 0.0728    | 0.562      |
-| nf4          | bnb    | **2,658**     | **1,327**       | 0.0728    | 0.562      |
-| fp4          | Quanta | 20,474        | 8,594           | 0.0965    | 0.562      |
-| fp4          | bnb    | **2,564**     | **1,328**       | 0.0965    | 0.562      |
+### Summary
 
-- **int8_linear**: Quanta is ~1.5× faster than bnb on quantize and matches on dequant. Lower MAE because Quanta uses linear absmax encoding while bnb's default is dynamic exponent.
-- **nf4 / fp4**: bit-identical numerics (same codebook). bnb's hand-written CUDA kernels are 2× faster on NF4 and 8× faster on FP4 — Quanta's NF4 has a Triton kernel; FP4 still rides the eager codebook path.
+| Comparison        | Quanta wins             | bitsandbytes wins         | Tie                              |
+|-------------------|-------------------------|---------------------------|----------------------------------|
+| Quantize latency  | int8 (2.80 vs 4.28 ms)  | nf4, fp4 (~2× slower)     | —                                |
+| Dequantize        | —                       | nf4, fp4 (~3.3× slower)   | int8 (1.51 vs 1.48 ms)           |
+| Round-trip MAE    | int8 (33% lower error)  | —                         | nf4, fp4 (codebooks identical)   |
+| Linear forward    | —                       | all schemes (1.8–4× gap)  | —                                |
+| Scaling vs size   | int8 at large dim       | nf4, fp4 across all sizes | —                                |
+| Storage footprint | —                       | —                         | all schemes identical            |
 
-Run `python example/benchmarks.py` to regenerate `benchmarks/results.md` and four PNG plots on your hardware.
+- **int8 quantize/MAE**: Quanta wins on both speed (~1.5×) and accuracy (33% lower MAE). 
+- **nf4 / fp4**: bit-identical numerics (same codebook, same MAE). 
 
 ## API
 
@@ -62,7 +62,7 @@ out = dequantize(state)
 
 ## Status
 
-`0.2.0` — quantization primitives + Linear modules are stable. CUDA NF4 path is Triton; full custom CUDA kernels and a real int8 GEMM Linear are on the roadmap.
+`0.2.0` — quantization primitives + Linear modules are stable. CUDA paths use Triton (NF4 / FP4 encode-decode, fused 4-bit weight matmul) and `torch._int_mm` for int8 Linear; full hand-written CUDA kernels are on the roadmap.
 
 ## License
 

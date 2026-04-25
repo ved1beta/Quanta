@@ -54,20 +54,60 @@ _FP4_CODE: Tuple[float, ...] = (
 )
 
 
+# Module-level cache keyed by (codebook_id, device, dtype). The sorted edges
+# and order permutation depend only on the codebook values, so they can be
+# computed once per (device, dtype) and reused across every quantize call.
+_CODEBOOK_CACHE: dict = {}
+
+
+def _codebook_meta(name: str, raw_values: Tuple[float, ...], device: torch.device, dtype: torch.dtype):
+    """Return (levels, edges, order, is_sorted) for a named codebook, cached."""
+    key = (name, device, dtype)
+    cached = _CODEBOOK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    levels = torch.tensor(raw_values, device=device, dtype=dtype)
+    sorted_levels, order = torch.sort(levels)
+    edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
+    is_sorted = bool(torch.equal(order, torch.arange(order.numel(), device=device)))
+    cached = (levels, edges.contiguous(), order.contiguous(), is_sorted)
+    _CODEBOOK_CACHE[key] = cached
+    return cached
+
+
 def _nf4_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.tensor(_NF4_LEVELS, device=device, dtype=dtype)
+    return _codebook_meta("nf4", _NF4_LEVELS, device, dtype)[0]
 
 
 def _nf8_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = ("nf8", device, dtype)
+    cached = _CODEBOOK_CACHE.get(key)
+    if cached is not None:
+        return cached[0]
     lvl = torch.linspace(-1.0, 1.0, 256, device=device, dtype=dtype)
-    return torch.tanh(lvl * 2)
+    levels = torch.tanh(lvl * 2)
+    sorted_levels, order = torch.sort(levels)
+    edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
+    is_sorted = bool(torch.equal(order, torch.arange(order.numel(), device=device)))
+    _CODEBOOK_CACHE[key] = (levels, edges.contiguous(), order.contiguous(), is_sorted)
+    return levels
 
 
 def _fp4_code(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return torch.tensor(_FP4_CODE, device=device, dtype=dtype)
+    return _codebook_meta("fp4", _FP4_CODE, device, dtype)[0]
 
 
 def _codebook_encode(normalized: torch.Tensor, levels: torch.Tensor) -> torch.Tensor:
+    # Find the cached (edges, order) for this `levels` tensor by identity match.
+    # Cheap: dict lookup over a few entries. Falls back to recomputing if
+    # someone passed a custom codebook tensor.
+    for cached in _CODEBOOK_CACHE.values():
+        if cached[0] is levels:
+            edges = cached[1]
+            order = cached[2]
+            is_sorted = cached[3]
+            sorted_idx = torch.bucketize(normalized.contiguous(), edges)
+            return sorted_idx if is_sorted else order[sorted_idx]
     sorted_levels, order = torch.sort(levels)
     edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
     sorted_idx = torch.bucketize(normalized.contiguous(), edges)
@@ -209,6 +249,31 @@ def quantize(
         return _quant_codebook(x32, levels=_nf8_levels(x.device, torch.float32), bits=8, scheme="nf8",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "fp4":
+        if (
+            _TRITON_ENABLED
+            and block_size is not None
+            and x.is_cuda
+            and block_size % 2 == 0
+        ):
+            try:
+                from Quanta.backends.triton_fp4 import (
+                    fp4_encode_blockwise_triton,
+                    triton_available,
+                )
+                if triton_available():
+                    packed, absmax, _ = fp4_encode_blockwise_triton(x32, block_size)
+                    return QuantState(
+                        qdata=packed,
+                        scheme="fp4",
+                        shape=orig_shape,
+                        dtype=orig_dtype,
+                        absmax=absmax,
+                        block_size=block_size,
+                        packed=True,
+                        code=_fp4_code(x.device, torch.float32),
+                    )
+            except Exception:
+                pass
         return _quant_codebook(x32, levels=_fp4_code(x.device, torch.float32), bits=4, scheme="fp4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "fp8":
@@ -235,6 +300,26 @@ def dequantize(state: QuantState) -> torch.Tensor:
                 )
                 if triton_available():
                     out = nf4_decode_blockwise_triton(
+                        state.qdata, state.absmax, state.code,
+                        state.shape, state.block_size,
+                    )
+                    return out.to(state.dtype)
+            except Exception:
+                pass
+        if (
+            _TRITON_ENABLED
+            and state.scheme == "fp4"
+            and state.packed
+            and state.block_size is not None
+            and state.qdata.is_cuda
+        ):
+            try:
+                from Quanta.backends.triton_fp4 import (
+                    fp4_decode_blockwise_triton,
+                    triton_available,
+                )
+                if triton_available():
+                    out = fp4_decode_blockwise_triton(
                         state.qdata, state.absmax, state.code,
                         state.shape, state.block_size,
                     )

@@ -120,10 +120,15 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
     Memory: ~4× smaller than fp32 ``nn.Linear`` (1 byte/weight + per-block
     scales) at ``block_size=64``.
 
+    Fast int8 GEMM: when ``block_size == in_features`` the weight has one
+    scale per output row, which is compatible with ``torch._int_mm`` — forward
+    quantizes the activation per-row, runs an int8×int8→int32 matmul, and
+    rescales. Otherwise forward falls back to dequant-and-fp-matmul.
+
     Example:
         >>> layer = Linear8bitLt(1024, 4096)
         >>> layer.weight.data.copy_(my_fp32_weight)
-        >>> layer.quantize_weight(block_size=64)
+        >>> layer.quantize_weight(block_size=1024)  # per-row → fast int_mm
         >>> y = layer(x)
     """
 
@@ -145,6 +150,8 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        self.register_buffer("_w_int8_t", None, persistent=False)
+
         self._q_scheme = None
         self.reset_parameters()
 
@@ -160,12 +167,53 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         block_size = block_size or self.block_size
         state = quantize(self.weight.data, scheme="int8_linear", block_size=block_size)
         self._store_qstate(state)
+        # Cache transposed int8 weight (in,out) for the fast int_mm path.
+        if (
+            block_size == self.in_features
+            and state.qdata.is_cuda
+            and hasattr(torch, "_int_mm")
+        ):
+            self._w_int8_t = state.qdata.t().contiguous()
+        else:
+            self._w_int8_t = None
         return self
+
+    # torch._int_mm has a CUDA constraint that M > 16. For smaller M we pad.
+    _INT_MM_MIN_M = 17
+
+    def _int_mm_forward(self, x: torch.Tensor, state: QuantState) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features).to(torch.float32)
+        M = x_2d.shape[0]
+        x_absmax = x_2d.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+        x_int8 = (x_2d / x_absmax * 127.0).round().clamp(-127, 127).to(torch.int8)
+
+        if M < self._INT_MM_MIN_M:
+            pad = self._INT_MM_MIN_M - M
+            x_int8 = torch.cat(
+                [x_int8, torch.zeros(pad, self.in_features, dtype=torch.int8, device=x.device)],
+                dim=0,
+            )
+            acc_i32 = torch._int_mm(x_int8.contiguous(), self._w_int8_t)
+            acc_i32 = acc_i32[:M]
+        else:
+            acc_i32 = torch._int_mm(x_int8.contiguous(), self._w_int8_t)
+        # Rescale: out = acc * (x_absmax/127) * (w_absmax/127)
+        out = acc_i32.to(torch.float32) * (x_absmax / 127.0) * (state.absmax.unsqueeze(0) / 127.0)
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+        return out.reshape(*orig_shape[:-1], self.out_features).to(x.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         state = self._qstate()
         if state is None:
             return F.linear(x, self.weight, self.bias)
+        if (
+            self._w_int8_t is not None
+            and x.is_cuda
+            and x.dim() >= 2
+        ):
+            return self._int_mm_forward(x, state)
         w = dequantize(state).to(x.dtype)
         return F.linear(x, w, self.bias)
 
@@ -229,10 +277,47 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
             self._bias_compute = self.bias.detach().to(self.compute_dtype)
         return self
 
+    def _try_fused_matmul(self, x: torch.Tensor, state: QuantState):
+        # Fused 4-bit weight matmul kernel: avoids materializing the fp16
+        # weight on every call. Returns None if any precondition fails so the
+        # caller can fall back.
+        if not (state.packed and state.qdata.is_cuda and state.scheme in ("nf4", "fp4")):
+            return None
+        if state.block_size is None or self.in_features % state.block_size != 0:
+            return None
+        try:
+            from Quanta.backends.triton_4bit_matmul import (
+                matmul_4bit_triton,
+                triton_available,
+            )
+        except ImportError:
+            return None
+        if not triton_available():
+            return None
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        try:
+            out = matmul_4bit_triton(
+                x_2d, state.qdata, state.absmax, state.code,
+                out_features=self.out_features,
+                in_features=self.in_features,
+                block_size=state.block_size,
+            )
+        except Exception:
+            return None
+        out = out.to(self.compute_dtype)
+        bias = self._bias_compute if self._bias_compute is not None else self.bias
+        if bias is not None:
+            out = out + bias.to(out.dtype)
+        return out.reshape(*orig_shape[:-1], self.out_features).to(x.dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         state = self._qstate()
         if state is None:
             return F.linear(x, self.weight, self.bias)
+        fused = self._try_fused_matmul(x, state)
+        if fused is not None:
+            return fused
         w = dequantize(state).to(self.compute_dtype)
         bias = self._bias_compute if self._bias_compute is not None else self.bias
         return F.linear(x.to(self.compute_dtype), w, bias)
