@@ -142,7 +142,8 @@ def matmul_4bit_triton(
 
     BLOCK_M = 16 if M >= 16 else max(1, 1 << (M - 1).bit_length())
     BLOCK_N = 64
-    USE_DOT = M >= 16
+    # tl.dot needs every dim >= 16; the contraction dim here is HALF.
+    USE_DOT = M >= 16 and block_size // 2 >= 16
 
     grid = ((N + BLOCK_N - 1) // BLOCK_N, (M + BLOCK_M - 1) // BLOCK_M)
     _4bit_matmul_kernel[grid](

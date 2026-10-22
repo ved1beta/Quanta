@@ -30,6 +30,7 @@ def quantize_model(
         model: Any ``nn.Module`` (plain torch or HF ``PreTrainedModel``).
         bits: 4 or 8.
         quant_type: 4-bit scheme — ``nf4`` (default), ``fp4`` or ``int4_linear``.
+            Ignored when ``bits=8``.
         block_size: Elements per scale block.
         skip: Module-name substrings left in full precision (``lm_head`` by default).
         compute_dtype: 4-bit matmul dtype; defaults to the original weight dtype.
@@ -42,8 +43,15 @@ def quantize_model(
         raise ValueError(f"bits must be 4 or 8, got {bits}")
     skip = tuple(skip)
     n = 0
-    for name, mod in list(model.named_modules()):
+    # A Linear reused under several names is quantized once and swapped in at
+    # every name, so the model never keeps a stale fp copy alongside it.
+    replaced = {}
+    for name, mod in list(model.named_modules(remove_duplicate=False)):
         if type(mod) is not nn.Linear or any(s in name for s in skip):
+            continue
+        if id(mod) in replaced:
+            parent_name, _, child = name.rpartition(".")
+            setattr(model.get_submodule(parent_name), child, replaced[id(mod)])
             continue
         # Build on "meta" so the placeholder weight never allocates memory.
         with torch.device("meta"):
@@ -61,6 +69,7 @@ def quantize_model(
         new.weight = nn.Parameter(mod.weight.data, requires_grad=False)
         new.bias = mod.bias
         new.quantize_weight()
+        replaced[id(mod)] = new
         parent_name, _, child = name.rpartition(".")
         setattr(model.get_submodule(parent_name), child, new)
         n += 1

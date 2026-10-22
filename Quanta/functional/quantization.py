@@ -15,7 +15,9 @@ Notes:
 
 from __future__ import annotations
 
+import functools
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -33,9 +35,40 @@ def _maybe_compile(fn):
     if not _COMPILE_ENABLED:
         return fn
     try:
-        return torch.compile(fn, dynamic=True, fullgraph=False)
+        compiled = torch.compile(fn, dynamic=True, fullgraph=False)
     except Exception:
         return fn
+
+    # torch.compile is lazy: backend failures surface on the first call, not
+    # above. Fall back to eager permanently once that happens.
+    state = {"broken": False}
+
+    @functools.wraps(fn)
+    def wrapper(*args):
+        if not state["broken"]:
+            try:
+                return compiled(*args)
+            except Exception as e:
+                state["broken"] = True
+                warnings.warn(
+                    f"torch.compile failed for {fn.__name__} ({type(e).__name__}); "
+                    "using eager. Set QUANTA_DISABLE_COMPILE=1 to silence.",
+                    RuntimeWarning,
+                )
+        return fn(*args)
+
+    return wrapper
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _warn_triton_fallback(what: str, exc: Exception) -> None:
+    warnings.warn(
+        f"Triton {what} failed ({type(exc).__name__}: {exc}); falling back to eager.",
+        RuntimeWarning,
+    )
 
 
 _NF4_LEVELS: Tuple[float, ...] = (
@@ -84,8 +117,12 @@ def _nf8_levels(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     cached = _CODEBOOK_CACHE.get(key)
     if cached is not None:
         return cached[0]
-    lvl = torch.linspace(-1.0, 1.0, 256, device=device, dtype=dtype)
-    levels = torch.tanh(lvl * 2)
+    # 255 symmetric levels (odd count → exact 0) normalized to span [-1, 1]
+    # so the block absmax round-trips exactly; the 256th code repeats +1.
+    lvl = torch.linspace(-1.0, 1.0, 255, device=device, dtype=torch.float64)
+    levels = torch.tanh(lvl * 2) / torch.tanh(torch.tensor(2.0, dtype=torch.float64))
+    levels[127] = 0.0  # linspace midpoint is ~1e-17, not exactly 0
+    levels = torch.cat([levels, levels[-1:]]).to(dtype)
     sorted_levels, order = torch.sort(levels)
     edges = (sorted_levels[:-1] + sorted_levels[1:]) / 2
     is_sorted = bool(torch.equal(order, torch.arange(order.numel(), device=device)))
@@ -164,6 +201,13 @@ def _linear_encode_blockwise_eager(blocks: torch.Tensor, qmax: int):
     return q, absmax.squeeze(-1)
 
 
+def _pertensor_absmax(x: torch.Tensor) -> torch.Tensor:
+    # amax() over an empty tensor raises; any scale works for zero elements.
+    if x.numel() == 0:
+        return torch.ones((), device=x.device, dtype=x.dtype)
+    return x.abs().amax().clamp(min=1e-8)
+
+
 def _linear_encode_pertensor_eager(x: torch.Tensor, qmax: int):
     absmax = x.abs().amax().clamp(min=1e-8)
     q = torch.round(x / absmax * qmax).clamp(-qmax, qmax).to(torch.int8)
@@ -209,30 +253,36 @@ def quantize(
     Returns:
         ``QuantState`` carrying the packed/unpacked qdata and all metadata.
     """
+    if block_size is not None and block_size <= 0:
+        raise ValueError(f"block_size must be a positive int or None, got {block_size}")
     orig_shape = x.shape
     orig_dtype = x.dtype
     x32 = x.float().contiguous()
+    # Triton kernels use tl.arange(0, block_size), which needs a power of 2.
+    use_triton_4bit = (
+        _TRITON_ENABLED
+        and block_size is not None
+        and x.is_cuda
+        and block_size >= 2
+        and _is_pow2(block_size)
+    )
 
     if scheme == "int8_linear":
         return _quant_linear(x32, bits=8, orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "int4_linear":
         return _quant_linear(x32, bits=4, orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf4":
-        if (
-            _TRITON_ENABLED
-            and block_size is not None
-            and x.is_cuda
-            and block_size % 2 == 0
-        ):
+        if use_triton_4bit:
             try:
                 from Quanta.backends.triton_nf4 import (
                     nf4_encode_blockwise_triton,
                     triton_available,
                 )
                 if triton_available():
-                    packed, absmax, _ = nf4_encode_blockwise_triton(x32, block_size)
+                    packed, absmax, n = nf4_encode_blockwise_triton(x32, block_size)
                     return QuantState(
-                        qdata=packed,
+                        # Kernel writes padded bytes; trim to the eager length.
+                        qdata=packed[: (n + 1) // 2],
                         scheme="nf4",
                         shape=orig_shape,
                         dtype=orig_dtype,
@@ -241,29 +291,24 @@ def quantize(
                         packed=True,
                         code=_nf4_levels(x.device, torch.float32),
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_triton_fallback("nf4 encode", e)
         return _quant_codebook(x32, levels=_nf4_levels(x.device, torch.float32), bits=4, scheme="nf4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "nf8":
         return _quant_codebook(x32, levels=_nf8_levels(x.device, torch.float32), bits=8, scheme="nf8",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "fp4":
-        if (
-            _TRITON_ENABLED
-            and block_size is not None
-            and x.is_cuda
-            and block_size % 2 == 0
-        ):
+        if use_triton_4bit:
             try:
                 from Quanta.backends.triton_fp4 import (
                     fp4_encode_blockwise_triton,
                     triton_available,
                 )
                 if triton_available():
-                    packed, absmax, _ = fp4_encode_blockwise_triton(x32, block_size)
+                    packed, absmax, n = fp4_encode_blockwise_triton(x32, block_size)
                     return QuantState(
-                        qdata=packed,
+                        qdata=packed[: (n + 1) // 2],
                         scheme="fp4",
                         shape=orig_shape,
                         dtype=orig_dtype,
@@ -272,12 +317,12 @@ def quantize(
                         packed=True,
                         code=_fp4_code(x.device, torch.float32),
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_triton_fallback("fp4 encode", e)
         return _quant_codebook(x32, levels=_fp4_code(x.device, torch.float32), bits=4, scheme="fp4",
                                orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     if scheme == "fp8":
-        return _quant_fp8(x32, orig_shape=orig_shape, orig_dtype=orig_dtype)
+        return _quant_fp8(x32, orig_shape=orig_shape, orig_dtype=orig_dtype, block_size=block_size)
     raise ValueError(f"Unknown scheme: {scheme!r}. Expected one of {VALID_SCHEMES}.")
 
 
@@ -288,44 +333,31 @@ def dequantize(state: QuantState) -> torch.Tensor:
     if state.scheme in ("nf4", "nf8", "fp4"):
         if (
             _TRITON_ENABLED
-            and state.scheme == "nf4"
+            and state.scheme in ("nf4", "fp4")
             and state.packed
             and state.block_size is not None
+            and _is_pow2(state.block_size)
             and state.qdata.is_cuda
         ):
             try:
-                from Quanta.backends.triton_nf4 import (
-                    nf4_decode_blockwise_triton,
-                    triton_available,
-                )
+                if state.scheme == "nf4":
+                    from Quanta.backends.triton_nf4 import (
+                        nf4_decode_blockwise_triton as decode_triton,
+                        triton_available,
+                    )
+                else:
+                    from Quanta.backends.triton_fp4 import (
+                        fp4_decode_blockwise_triton as decode_triton,
+                        triton_available,
+                    )
                 if triton_available():
-                    out = nf4_decode_blockwise_triton(
+                    out = decode_triton(
                         state.qdata, state.absmax, state.code,
                         state.shape, state.block_size,
                     )
                     return out.to(state.dtype)
-            except Exception:
-                pass
-        if (
-            _TRITON_ENABLED
-            and state.scheme == "fp4"
-            and state.packed
-            and state.block_size is not None
-            and state.qdata.is_cuda
-        ):
-            try:
-                from Quanta.backends.triton_fp4 import (
-                    fp4_decode_blockwise_triton,
-                    triton_available,
-                )
-                if triton_available():
-                    out = fp4_decode_blockwise_triton(
-                        state.qdata, state.absmax, state.code,
-                        state.shape, state.block_size,
-                    )
-                    return out.to(state.dtype)
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_triton_fallback(f"{state.scheme} decode", e)
         return _dequant_codebook(state)
     if state.scheme == "fp8":
         return _dequant_fp8(state)
@@ -350,7 +382,10 @@ def _quant_linear(x, *, bits, orig_shape, orig_dtype, block_size):
             block_size=block_size,
             packed=(bits == 4),
         )
-    q, absmax = _linear_encode_pertensor(x, qmax)
+    if x.numel() == 0:
+        q, absmax = x.to(torch.int8), _pertensor_absmax(x)
+    else:
+        q, absmax = _linear_encode_pertensor(x, qmax)
     qdata = q.reshape(orig_shape)
     return QuantState(
         qdata=_maybe_pack(qdata, bits),
@@ -414,7 +449,7 @@ def _quant_codebook(x, *, levels, bits, scheme, orig_shape, orig_dtype, block_si
             packed=(bits == 4),
             code=levels,
         )
-    absmax = x.abs().amax().clamp(min=1e-8)
+    absmax = _pertensor_absmax(x)
     normalized = (x / absmax).clamp(levels.min(), levels.max())
     idx = _codebook_encode(normalized, levels).to(torch.uint8).reshape(orig_shape)
     return QuantState(
@@ -454,35 +489,49 @@ def _dequant_codebook(state: QuantState) -> torch.Tensor:
     return _codebook_decode(idx, state.code, state.absmax).reshape(state.shape).to(state.dtype)
 
 
-def _quant_fp8(x, *, orig_shape, orig_dtype):
-    # 1 sign / 4 exponent / 3 mantissa, bias 7. Analytical encode keeps the
-    # storage at one byte per value without a 256-entry LUT.
-    signs = torch.sign(x)
-    abs_values = torch.abs(x)
-    log_values = torch.log2(abs_values + (abs_values == 0).float())
-    exp_bias = 7
-    exp_values = torch.clamp(torch.round(log_values + exp_bias), 0, 15)
-    mantissa_values = torch.round((abs_values / (2 ** (exp_values - exp_bias))) * 8 - 8)
-    mantissa_values = torch.clamp(mantissa_values, 0, 7)
-    exp_values = exp_values.to(torch.uint8)
-    mantissa_values = mantissa_values.to(torch.uint8)
-    q = ((exp_values << 3) | mantissa_values).to(torch.uint8)
-    signs_u = (signs < 0).to(torch.bool)
-    q = torch.where(signs_u, q | 0x80, q)
+_FP8_MAX = 448.0  # largest finite float8_e4m3fn
+
+
+def _fp8_cast_device(t: torch.Tensor) -> torch.device:
+    # MPS has no float8 dtype; do the bit conversion on CPU there.
+    return torch.device("cpu") if t.device.type == "mps" else t.device
+
+
+def _quant_fp8(x, *, orig_shape, orig_dtype, block_size):
+    # Scale by absmax so the tensor spans the full E4M3 range (±448), then let
+    # torch do the round-to-nearest-even cast. Stored as the raw uint8 bits.
+    if block_size:
+        blocks, pad = _pad_for_blocks(x, block_size)
+        absmax = blocks.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+        scaled = (blocks / absmax * _FP8_MAX).reshape(-1)
+        if pad:
+            scaled = scaled[:-pad]
+        absmax = absmax.squeeze(-1)
+    else:
+        absmax = _pertensor_absmax(x)
+        scaled = x / absmax * _FP8_MAX
+    scaled = scaled.clamp(-_FP8_MAX, _FP8_MAX)  # e4m3fn has no inf
+    q = scaled.to(_fp8_cast_device(x)).to(torch.float8_e4m3fn).view(torch.uint8)
     return QuantState(
-        qdata=q.reshape(orig_shape),
+        qdata=q.to(x.device).reshape(orig_shape),
         scheme="fp8",
         shape=orig_shape,
         dtype=orig_dtype,
-        absmax=torch.tensor(float(exp_bias)),
+        absmax=absmax,
+        block_size=block_size,
     )
 
 
 def _dequant_fp8(state: QuantState) -> torch.Tensor:
-    q = state.qdata.to(torch.uint8)
-    bias = float(state.absmax.item()) if isinstance(state.absmax, torch.Tensor) else float(state.absmax)
-    signs = torch.where(q & 0x80 > 0, -1.0, 1.0)
-    exp_values = (q >> 3) & 0x0F
-    mantissa_values = q & 0x07
-    values = (1.0 + mantissa_values.float() / 8.0) * (2.0 ** (exp_values.float() - bias))
-    return (values * signs).to(state.dtype)
+    q = state.qdata
+    vals = q.to(_fp8_cast_device(q)).view(torch.float8_e4m3fn).float().to(q.device)
+    if state.block_size:
+        flat = vals.reshape(-1)
+        pad = (-flat.numel()) % state.block_size
+        if pad:
+            flat = torch.cat([flat, flat.new_zeros(pad)])
+        out = (flat.view(-1, state.block_size) * (state.absmax.unsqueeze(-1) / _FP8_MAX)).reshape(-1)
+        if pad:
+            out = out[:-pad]
+        return out.reshape(state.shape).to(state.dtype)
+    return (vals * (state.absmax / _FP8_MAX)).reshape(state.shape).to(state.dtype)

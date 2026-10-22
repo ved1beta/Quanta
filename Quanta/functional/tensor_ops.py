@@ -14,13 +14,18 @@ import torch
 from .quantization import QuantState, quantize, dequantize
 
 
+def int_mm_supported(m: int, k: int, n: int) -> bool:
+    """Shape constraints of ``torch._int_mm`` on CUDA: M > 16, K and N multiples of 8."""
+    return hasattr(torch, "_int_mm") and m > 16 and k % 8 == 0 and n % 8 == 0
+
+
 def quantized_matmul(
     a: torch.Tensor,
     b: torch.Tensor,
     scheme: str = "int8_linear",
     block_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Quantize ``a`` and ``b``, dequant, matmul, requant.
+    """Quantize ``a`` and ``b``, dequant, then matmul (simulated quantization).
 
     Always correct, but compute happens at fp32. Prefer
     :func:`quantized_matmul_int8` for 2-D int8 × int8 on CUDA.
@@ -50,7 +55,7 @@ def quantized_matmul_int8(
         a_int8.is_cuda and b_int8.is_cuda
         and a_int8.dim() == 2 and b_int8.dim() == 2
         and a_int8.dtype == torch.int8 and b_int8.dtype == torch.int8
-        and hasattr(torch, "_int_mm")
+        and int_mm_supported(a_int8.shape[0], a_int8.shape[1], b_int8.shape[1])
     )
     if use_int_mm:
         acc_i32 = torch._int_mm(a_int8.contiguous(), b_int8.contiguous())

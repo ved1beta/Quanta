@@ -2,9 +2,9 @@
 
 Both layers hold an fp32 master weight in ``self.weight`` until
 ``.quantize_weight()`` is called. After that the quantized tensors
-(``qdata``, ``absmax``, optional ``code``) live on the module as buffers, so
-they move with ``.to(device)`` and round-trip through ``state_dict()`` /
-``load_state_dict()``. Scheme metadata rides along via
+(``qdata``, ``absmax``, optional ``code``) live on the module as registered
+buffers, so they move with ``.to(device)`` and round-trip through
+``state_dict()`` / ``load_state_dict()``. Scheme metadata rides along via
 ``get_extra_state`` / ``set_extra_state``.
 """
 
@@ -19,9 +19,12 @@ import torch.nn.functional as F
 
 from Quanta.functional.quantization import (
     QuantState,
+    _is_pow2,
+    _warn_triton_fallback,
     dequantize,
     quantize,
 )
+from Quanta.functional.tensor_ops import int_mm_supported
 
 
 _VALID_4BIT_SCHEMES = {"nf4", "fp4", "int4_linear"}
@@ -32,6 +35,15 @@ _Q_META_KEYS = ("q_scheme", "q_block_size", "q_packed", "q_shape", "q_dtype")
 
 class _QuantizedLinearMixin:
     """Shared state_dict persistence + ``QuantState`` reconstruction helpers."""
+
+    _ALLOWED_SCHEMES: frozenset = frozenset()
+
+    def _init_qbuffers(self) -> None:
+        # Registered (as None) up front so later assignments land in _buffers
+        # and follow .to()/.cuda() and state_dict like any other buffer.
+        for name in _Q_TENSOR_NAMES:
+            self.register_buffer(name, None)
+        self._q_scheme = None
 
     def _store_qstate(self, state: QuantState) -> None:
         self.qdata = state.qdata
@@ -63,22 +75,19 @@ class _QuantizedLinearMixin:
             code=getattr(self, "code", None),
         )
 
-    def _save_to_state_dict(self, destination, prefix, keep_vars):
-        super()._save_to_state_dict(destination, prefix, keep_vars)
-        if getattr(self, "_q_scheme", None) is None:
-            return
-        for name in _Q_TENSOR_NAMES:
-            t = getattr(self, name, None)
-            if t is None:
-                continue
-            destination[prefix + name] = t if keep_vars else t.detach()
-
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
+        # Quantized buffer shapes/dtypes come from the checkpoint, so size them
+        # here (on this module's device) and let super() copy the values in.
+        ckpt_quantized = bool(state_dict.get(prefix + "_extra_state"))
         for name in _Q_TENSOR_NAMES:
             key = prefix + name
+            current = getattr(self, name, None)
             if key in state_dict:
-                setattr(self, name, state_dict.pop(key))
+                device = current.device if current is not None else self.weight.device
+                setattr(self, name, torch.empty_like(state_dict[key], device=device))
+            elif ckpt_quantized and current is not None:
+                setattr(self, name, None)  # e.g. ``code`` absent for int4_linear
 
         # Shrink the fp32 weight Parameter to match a checkpoint where it was
         # already freed; otherwise super's loader raises a size mismatch.
@@ -111,11 +120,46 @@ class _QuantizedLinearMixin:
         if not state:
             self._q_scheme = None
             return
-        self._q_scheme = state.get("q_scheme")
+        scheme = state.get("q_scheme")
+        if scheme not in self._ALLOWED_SCHEMES:
+            raise ValueError(
+                f"{type(self).__name__} cannot load a checkpoint quantized with "
+                f"scheme={scheme!r}; expected one of {sorted(self._ALLOWED_SCHEMES)}."
+            )
+        self._q_scheme = scheme
         self._q_block_size = state.get("q_block_size")
         self._q_packed = state.get("q_packed", False)
         self._q_shape = state.get("q_shape")
         self._q_dtype = state.get("q_dtype", torch.float32)
+
+
+class _Fused4bitMatmul(torch.autograd.Function):
+    """Differentiable wrapper around the Triton 4-bit matmul.
+
+    The weight is frozen, so backward only produces the input gradient:
+    ``grad_x = grad_y @ dequant(W)``.
+    """
+
+    @staticmethod
+    def forward(ctx, x_2d, state, out_features, in_features):
+        from Quanta.backends.triton_4bit_matmul import matmul_4bit_triton
+
+        ctx.state = state
+        ctx.x_dtype = x_2d.dtype
+        return matmul_4bit_triton(
+            x_2d, state.qdata, state.absmax, state.code,
+            out_features=out_features,
+            in_features=in_features,
+            block_size=state.block_size,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        grad_x = None
+        if ctx.needs_input_grad[0]:
+            w = dequantize(ctx.state).to(grad_out.dtype)
+            grad_x = (grad_out @ w).to(ctx.x_dtype)
+        return grad_x, None, None, None
 
 
 class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
@@ -128,6 +172,8 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
     scale per output row, which is compatible with ``torch._int_mm`` — forward
     quantizes the activation per-row, runs an int8×int8→int32 matmul, and
     rescales. Otherwise forward falls back to dequant-and-fp-matmul.
+    ``torch._int_mm`` also needs ``in_features`` and ``out_features`` to be
+    multiples of 8.
 
     Example:
         >>> layer = Linear8bitLt(1024, 4096)
@@ -135,6 +181,8 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         >>> layer.quantize_weight(block_size=1024)  # per-row → fast int_mm
         >>> y = layer(x)
     """
+
+    _ALLOWED_SCHEMES = frozenset({"int8_linear"})
 
     def __init__(
         self,
@@ -154,9 +202,7 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self.register_buffer("_w_int8_t", None, persistent=False)
-
-        self._q_scheme = None
+        self._init_qbuffers()
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -171,21 +217,17 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         block_size = block_size or self.block_size
         state = quantize(self.weight.data, scheme="int8_linear", block_size=block_size)
         self._store_qstate(state)
-        self._refresh_cache()
         return self
 
-    def _refresh_cache(self) -> None:
-        # Cache transposed int8 weight (in,out) for the fast int_mm path.
-        state = self._qstate()
-        if (
-            state is not None
-            and state.block_size == self.in_features
+    def _can_int_mm(self, x: torch.Tensor, state: QuantState) -> bool:
+        # Per-row weight scales (one block per row) are what int_mm rescaling
+        # needs. M is padded up in _int_mm_forward, so only K and N matter.
+        return (
+            x.is_cuda
             and state.qdata.is_cuda
-            and hasattr(torch, "_int_mm")
-        ):
-            self._w_int8_t = state.qdata.t().contiguous()
-        else:
-            self._w_int8_t = None
+            and state.block_size == self.in_features
+            and int_mm_supported(self._INT_MM_MIN_M, self.in_features, self.out_features)
+        )
 
     # torch._int_mm has a CUDA constraint that M > 16. For smaller M we pad.
     _INT_MM_MIN_M = 17
@@ -196,6 +238,9 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         M = x_2d.shape[0]
         x_absmax = x_2d.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
         x_int8 = (x_2d / x_absmax * 127.0).round().clamp(-127, 127).to(torch.int8)
+        # (K, N) column-major view of the row-major (N, K) weight: no copy, and
+        # the layout cuBLAS int8 GEMM prefers for the second operand.
+        w_t = state.qdata.t()
 
         if M < self._INT_MM_MIN_M:
             pad = self._INT_MM_MIN_M - M
@@ -203,10 +248,10 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
                 [x_int8, torch.zeros(pad, self.in_features, dtype=torch.int8, device=x.device)],
                 dim=0,
             )
-            acc_i32 = torch._int_mm(x_int8.contiguous(), self._w_int8_t)
+            acc_i32 = torch._int_mm(x_int8.contiguous(), w_t)
             acc_i32 = acc_i32[:M]
         else:
-            acc_i32 = torch._int_mm(x_int8.contiguous(), self._w_int8_t)
+            acc_i32 = torch._int_mm(x_int8.contiguous(), w_t)
         # Rescale: out = acc * (x_absmax/127) * (w_absmax/127)
         out = acc_i32.to(torch.float32) * (x_absmax / 127.0) * (state.absmax.unsqueeze(0) / 127.0)
         if self.bias is not None:
@@ -217,14 +262,11 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         state = self._qstate()
         if state is None:
             return F.linear(x, self.weight, self.bias)
-        if (
-            self._w_int8_t is not None
-            and x.is_cuda
-            and x.dim() >= 2
-        ):
+        if x.dim() >= 2 and self._can_int_mm(x, state):
             return self._int_mm_forward(x, state)
         w = dequantize(state).to(x.dtype)
-        return F.linear(x, w, self.bias)
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w, bias)
 
 
 class Linear4bit(_QuantizedLinearMixin, nn.Module):
@@ -234,9 +276,12 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
     scales) at ``block_size=64``.
 
     ``compute_dtype`` is the dtype the dequantized weight is materialized in
-    and the matmul runs in (default fp16). The bias is cast once at
+    and the matmul runs in (default fp16); the output is cast back to the
+    input dtype. The bias is cast once at
     ``quantize_weight`` time and cached so forward doesn't reallocate.
     """
+
+    _ALLOWED_SCHEMES = frozenset(_VALID_4BIT_SCHEMES)
 
     def __init__(
         self,
@@ -267,7 +312,7 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
 
         self.register_buffer("_bias_compute", None, persistent=False)
 
-        self._q_scheme = None
+        self._init_qbuffers()
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -295,13 +340,14 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
         # caller can fall back.
         if not (state.packed and state.qdata.is_cuda and state.scheme in ("nf4", "fp4")):
             return None
-        if state.block_size is None or self.in_features % state.block_size != 0:
+        if (
+            state.block_size is None
+            or not _is_pow2(state.block_size)
+            or self.in_features % state.block_size != 0
+        ):
             return None
         try:
-            from Quanta.backends.triton_4bit_matmul import (
-                matmul_4bit_triton,
-                triton_available,
-            )
+            from Quanta.backends.triton_4bit_matmul import triton_available
         except ImportError:
             return None
         if not triton_available():
@@ -309,13 +355,9 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.in_features)
         try:
-            out = matmul_4bit_triton(
-                x_2d, state.qdata, state.absmax, state.code,
-                out_features=self.out_features,
-                in_features=self.in_features,
-                block_size=state.block_size,
-            )
-        except Exception:
+            out = _Fused4bitMatmul.apply(x_2d, state, self.out_features, self.in_features)
+        except Exception as e:
+            _warn_triton_fallback("4-bit matmul", e)
             return None
         out = out.to(self.compute_dtype)
         bias = self._bias_compute if self._bias_compute is not None else self.bias
@@ -332,4 +374,4 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
             return fused
         w = dequantize(state).to(self.compute_dtype)
         bias = self._bias_compute if self._bias_compute is not None else self.bias
-        return F.linear(x.to(self.compute_dtype), w, bias)
+        return F.linear(x.to(self.compute_dtype), w, bias).to(x.dtype)
