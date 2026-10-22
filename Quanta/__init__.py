@@ -11,7 +11,7 @@ from .functional import (
     quantized_matmul,
     quantized_matmul_int8,
 )
-from .nn import Linear4bit, Linear8bitLt
+from .nn import Linear4bit, Linear8bitLt, quantize_model
 
 __version__ = "0.2.0"
 
@@ -24,6 +24,7 @@ __all__ = [
     "quantized_matmul_int8",
     "Linear8bitLt",
     "Linear4bit",
+    "quantize_model",
     "functional",
     "nn",
 ]

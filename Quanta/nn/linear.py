@@ -97,6 +97,10 @@ class _QuantizedLinearMixin:
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
         )
+        self._refresh_cache()
+
+    def _refresh_cache(self) -> None:
+        """Rebuild non-persistent tensors derived from the quantized state."""
 
     def get_extra_state(self):
         if not getattr(self, "_q_scheme", None):
@@ -167,16 +171,21 @@ class Linear8bitLt(_QuantizedLinearMixin, nn.Module):
         block_size = block_size or self.block_size
         state = quantize(self.weight.data, scheme="int8_linear", block_size=block_size)
         self._store_qstate(state)
+        self._refresh_cache()
+        return self
+
+    def _refresh_cache(self) -> None:
         # Cache transposed int8 weight (in,out) for the fast int_mm path.
+        state = self._qstate()
         if (
-            block_size == self.in_features
+            state is not None
+            and state.block_size == self.in_features
             and state.qdata.is_cuda
             and hasattr(torch, "_int_mm")
         ):
             self._w_int8_t = state.qdata.t().contiguous()
         else:
             self._w_int8_t = None
-        return self
 
     # torch._int_mm has a CUDA constraint that M > 16. For smaller M we pad.
     _INT_MM_MIN_M = 17
@@ -273,9 +282,12 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
         block_size = block_size or self.block_size
         state = quantize(self.weight.data, scheme=self.quant_type, block_size=block_size)
         self._store_qstate(state)
+        self._refresh_cache()
+        return self
+
+    def _refresh_cache(self) -> None:
         if self.bias is not None:
             self._bias_compute = self.bias.detach().to(self.compute_dtype)
-        return self
 
     def _try_fused_matmul(self, x: torch.Tensor, state: QuantState):
         # Fused 4-bit weight matmul kernel: avoids materializing the fp16

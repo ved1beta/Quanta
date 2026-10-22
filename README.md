@@ -29,6 +29,28 @@ y = layer(torch.randn(8, 1024, device="cuda"))
 
 Schemes: `int8_linear`, `int4_linear`, `nf4`, `nf8`, `fp4`, `fp8`. Pass `block_size=N` for blockwise scales (robust to outliers).
 
+### Whole-model quantization
+
+Bring any `nn.Module` (plain torch or a Hugging Face model) and convert it to 4-bit or 8-bit in one call. Every `nn.Linear` is swapped for `Linear4bit` / `Linear8bitLt` in place; `lm_head` stays in full precision by default.
+
+```python
+from transformers import AutoModelForCausalLM
+from Quanta import quantize_model
+
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B", torch_dtype=torch.bfloat16)
+quantize_model(model, bits=4)                     # nf4, block_size=64
+# quantize_model(model, bits=4, quant_type="fp4")
+# quantize_model(model, bits=8, block_size=2048)  # per-row scales → torch._int_mm on CUDA
+
+torch.save(model.state_dict(), "llama-1b-nf4.pt")
+
+# Reload: rebuild the skeleton, quantize with the same args, then load.
+model = quantize_model(AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B"), bits=4)
+model.load_state_dict(torch.load("llama-1b-nf4.pt"))
+```
+
+`skip=("lm_head", "embed")` excludes modules by name substring; `compute_dtype` sets the 4-bit matmul dtype (defaults to the model's weight dtype).
+
 ## Benchmarks
 
 `benchmarks/bench_vs_bnb.py` measures Quanta against bitsandbytes for quantize/dequantize latency, round-trip MAE, Linear forward latency, scaling with matrix size, and storage footprint. RTX 3050 6GB at `block_size=64`, weight matrix 4096 × 11008 (~45 M elements).
@@ -50,7 +72,7 @@ Schemes: `int8_linear`, `int4_linear`, `nf4`, `nf8`, `fp4`, `fp8`. Pass `block_s
 ## API
 
 ```python
-from Quanta import quantize, dequantize, QuantState, Linear8bitLt, Linear4bit
+from Quanta import quantize, dequantize, QuantState, Linear8bitLt, Linear4bit, quantize_model
 
 state: QuantState = quantize(tensor, scheme="nf4", block_size=64)
 out = dequantize(state)

@@ -6,6 +6,7 @@ Two paths:
    ``dequantize``. The returned ``QuantState`` carries every byte of metadata.
 2. nn modules: drop-in replacements for ``nn.Linear`` (``Linear8bitLt``,
    ``Linear4bit``).
+3. Whole model: ``quantize_model(model, bits=4)`` swaps every ``nn.Linear``.
 """
 
 import sys
@@ -15,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 
-from Quanta import Linear4bit, Linear8bitLt, dequantize, quantize
+from Quanta import Linear4bit, Linear8bitLt, dequantize, quantize, quantize_model
 
 
 def functional_demo() -> None:
@@ -41,7 +42,20 @@ def int8_linear_demo() -> None:
     print(f"Linear8bitLt out: {y.shape}")
 
 
+def model_demo() -> None:
+    model = torch.nn.Sequential(
+        torch.nn.Linear(512, 1024), torch.nn.GELU(), torch.nn.Linear(1024, 512)
+    )
+    x = torch.randn(4, 512)
+    ref = model(x)
+    quantize_model(model, bits=4)
+    out = model(x)
+    print(f"quantize_model(bits=4): {model[0].__class__.__name__}, "
+          f"rel err {(out - ref).abs().mean() / ref.abs().mean():.3f}")
+
+
 if __name__ == "__main__":
     functional_demo()
     linear_demo()
     int8_linear_demo()
+    model_demo()
