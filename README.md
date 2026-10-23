@@ -8,7 +8,7 @@ Lightweight quantization primitives for PyTorch — int8 / int4 / NF4 / FP4 / NF
 pip install -e .
 ```
 
-Requires `torch >= 2.2`. Triton is optional (used to accelerate blockwise NF4 on CUDA); falls back to eager PyTorch otherwise.
+Requires `torch >= 2.2`. Triton is optional (used for NF4/FP4 encode-decode and the fused 4-bit matmul on CUDA); falls back to eager PyTorch otherwise.
 
 ## Quickstart
 
@@ -53,21 +53,26 @@ model.load_state_dict(torch.load("llama-1b-nf4.pt"))
 
 ## Benchmarks
 
-`benchmarks/bench_vs_bnb.py` measures Quanta against bitsandbytes for quantize/dequantize latency, round-trip MAE, Linear forward latency, scaling with matrix size, and storage footprint. RTX 3050 6GB at `block_size=64`, weight matrix 4096 × 11008 (~45 M elements).
+`benchmarks/bench_vs_bnb.py` measures Quanta against bitsandbytes for quantize/dequantize latency, round-trip MAE, Linear forward latency, scaling with matrix size, and storage footprint (`--plot` regenerates `benchmarks/plots/`). Numbers below: NVIDIA A40, torch 2.14, bitsandbytes 0.50.2, `block_size=64`, weight matrix 11008 × 4096 (~45 M elements).
+
+```bash
+pip install -e ".[benchmark]"
+python benchmarks/bench_vs_bnb.py --plot
+```
 
 ### Summary
 
-| Comparison        | Quanta wins             | bitsandbytes wins         | Tie                              |
-|-------------------|-------------------------|---------------------------|----------------------------------|
-| Quantize latency  | int8 (2.80 vs 4.28 ms)  | nf4, fp4 (~2× slower)     | —                                |
-| Dequantize        | —                       | nf4, fp4 (~3.3× slower)   | int8 (1.51 vs 1.48 ms)           |
-| Round-trip MAE    | int8 (33% lower error)  | —                         | nf4, fp4 (codebooks identical)   |
-| Linear forward    | —                       | all schemes (1.8–4× gap)  | —                                |
-| Scaling vs size   | int8 at large dim       | nf4, fp4 across all sizes | —                                |
-| Storage footprint | —                       | —                         | all schemes identical            |
+| Comparison        | Quanta wins                     | bitsandbytes wins                | Tie                            |
+|-------------------|---------------------------------|----------------------------------|--------------------------------|
+| Quantize latency  | int8 (0.38 vs 0.92 ms)          | nf4 (1.7×), fp4 (3.4×)           | —                              |
+| Dequantize        | —                               | nf4, fp4 (~1.8×)                 | int8 (0.42 ms both)            |
+| Round-trip MAE    | int8 (33% lower error)          | —                                | nf4, fp4 (codebooks identical) |
+| Linear forward    | int8 at M=16                    | nf4/fp4 at all M (1.8–4.5×), int8 elsewhere | —                   |
+| Storage footprint | —                               | —                                | all schemes identical          |
 
-- **int8 quantize/MAE**: Quanta wins on both speed (~1.5×) and accuracy (33% lower MAE). 
-- **nf4 / fp4**: bit-identical numerics (same codebook, same MAE). 
+- **int8 quantize/MAE**: Quanta is ~2.4× faster to quantize and has 33% lower MAE.
+- **nf4 / fp4**: bit-identical numerics (same codebook, same MAE).
+- **4-bit Linear**: the fused Triton kernel is used for M ≤ 16 (decode); larger batches dequantize and call cuBLAS.
 
 ## API
 

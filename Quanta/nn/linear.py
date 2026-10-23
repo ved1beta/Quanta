@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from Quanta.functional.quantization import (
+    _TRITON_ENABLED,
     QuantState,
     _is_pow2,
     _warn_triton_fallback,
@@ -110,6 +111,17 @@ class _QuantizedLinearMixin:
 
     def _refresh_cache(self) -> None:
         """Rebuild non-persistent tensors derived from the quantized state."""
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse)
+        # Keep quantization scales in fp32 through .half()/.bfloat16(), like
+        # bitsandbytes; fp16 absmax costs accuracy for negligible memory.
+        for name in ("absmax", "code"):
+            t = getattr(self, name, None)
+            if t is not None and t.dtype != torch.float32:
+                setattr(self, name, t.float())
+        self._refresh_cache()  # cached bias must stay in compute_dtype
+        return self
 
     def get_extra_state(self):
         if not getattr(self, "_q_scheme", None):
@@ -334,11 +346,22 @@ class Linear4bit(_QuantizedLinearMixin, nn.Module):
         if self.bias is not None:
             self._bias_compute = self.bias.detach().to(self.compute_dtype)
 
+    # The fused kernel is a gemv-style kernel: it beats dequant + cuBLAS only
+    # for decode-sized batches and falls far behind above this.
+    _FUSED_MAX_M = 16
+
     def _try_fused_matmul(self, x: torch.Tensor, state: QuantState):
         # Fused 4-bit weight matmul kernel: avoids materializing the fp16
         # weight on every call. Returns None if any precondition fails so the
         # caller can fall back.
-        if not (state.packed and state.qdata.is_cuda and state.scheme in ("nf4", "fp4")):
+        if not (
+            _TRITON_ENABLED
+            and state.packed
+            and state.qdata.is_cuda
+            and state.scheme in ("nf4", "fp4")
+        ):
+            return None
+        if x.numel() // self.in_features > self._FUSED_MAX_M:
             return None
         if (
             state.block_size is None

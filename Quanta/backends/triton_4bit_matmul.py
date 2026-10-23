@@ -17,6 +17,8 @@ Layout assumptions:
 
 from __future__ import annotations
 
+import inspect
+
 import torch
 
 try:
@@ -28,6 +30,17 @@ except ImportError:
 
 
 if _TRITON_OK:
+
+    # tl.dot defaults to TF32 for fp32 operands (~1e-3 rel error). The knob was
+    # renamed from allow_tf32 to input_precision in Triton 2.3/3.0.
+    if "input_precision" in inspect.signature(tl.dot).parameters:
+        @triton.jit
+        def _dot_fp32(a, b):
+            return tl.dot(a, b, input_precision="ieee")
+    else:
+        @triton.jit
+        def _dot_fp32(a, b):
+            return tl.dot(a, b, allow_tf32=False)
 
     @triton.jit
     def _4bit_matmul_kernel(
@@ -90,8 +103,8 @@ if _TRITON_OK:
             # BLOCK_M >= 16 for tl.dot.
             if USE_DOT:
                 # contraction over QBLK split into two HALF contractions
-                acc += tl.dot(x_even.to(tl.float32), tl.trans(w_low.to(tl.float32)))
-                acc += tl.dot(x_odd.to(tl.float32), tl.trans(w_high.to(tl.float32)))
+                acc += _dot_fp32(x_even.to(tl.float32), tl.trans(w_low.to(tl.float32)))
+                acc += _dot_fp32(x_odd.to(tl.float32), tl.trans(w_high.to(tl.float32)))
             else:
                 acc += tl.sum(x_even[:, None, :] * w_low[None, :, :], axis=2)
                 acc += tl.sum(x_odd[:, None, :] * w_high[None, :, :], axis=2)

@@ -2,6 +2,7 @@
 moves, checkpoint loading, autograd, and shared modules."""
 
 import io
+import os
 
 import pytest
 import torch
@@ -134,3 +135,64 @@ def test_fused_matmul_backward(monkeypatch):
     x_ref = x.detach().clone().requires_grad_()
     (x_ref @ w_deq.T).sum().backward()
     assert torch.allclose(x.grad, x_ref.grad, atol=1e-5)
+
+
+needs_triton = pytest.mark.skipif(
+    not tmm.triton_available() or os.environ.get("QUANTA_DISABLE_TRITON") == "1",
+    reason="needs CUDA + Triton",
+)
+
+
+@needs_triton
+@pytest.mark.parametrize("quant_type", ["nf4", "fp4"])
+@pytest.mark.parametrize("M", [1, 16])
+def test_fused_kernel_fp32_precision_and_backward(quant_type, M):
+    torch.manual_seed(0)
+    layer = Linear4bit(512, 384, quant_type=quant_type, compute_dtype=torch.float32).cuda().quantize_weight()
+    w = dequantize(layer._qstate()).float()
+    x = torch.randn(M, 512, device="cuda", requires_grad=True)
+    calls = []
+    orig = tmm.matmul_4bit_triton
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(tmm, "matmul_4bit_triton", lambda *a, **k: calls.append(1) or orig(*a, **k))
+        y = layer(x)
+    assert calls
+    # M=16 takes the tl.dot path; TF32 there gives ~1e-3 relative error.
+    torch.testing.assert_close(y, torch.nn.functional.linear(x.detach(), w, layer.bias), rtol=1e-5, atol=1e-5)
+    g = torch.randn_like(y)
+    y.backward(g)
+    torch.testing.assert_close(x.grad, g @ w)
+
+
+@needs_triton
+def test_fused_kernel_skipped_for_large_batch(monkeypatch):
+    layer = Linear4bit(256, 128).cuda().quantize_weight()
+    monkeypatch.setattr(tmm, "matmul_4bit_triton", lambda *a, **k: pytest.fail("fused kernel used"))
+    layer(torch.randn(Linear4bit._FUSED_MAX_M + 1, 256, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="int_mm requires CUDA")
+@pytest.mark.parametrize("M", [3, 64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_int_mm_path_with_transposed_view(M, dtype, monkeypatch):
+    layer = Linear8bitLt(256, 128).cuda().quantize_weight(block_size=256)
+    seen = []
+    orig = torch._int_mm
+    monkeypatch.setattr(torch, "_int_mm", lambda a, b: seen.append(b.is_contiguous()) or orig(a, b))
+    x = torch.randn(M, 256, device="cuda", dtype=dtype)
+    y = layer(x)
+    assert seen == [False]
+    ref = torch.nn.functional.linear(x.float(), dequantize(layer._qstate()).float(), layer.bias)
+    assert y.dtype == dtype
+    assert ((y.float() - ref).abs().max() / ref.abs().max()) < 2e-2
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_scales_stay_fp32_after_half(device, dtype):
+    model = quantize_model(nn.Sequential(nn.Linear(64, 64), nn.Linear(64, 64)), bits=4, skip=())
+    model.to(device=device, dtype=dtype)
+    for m in model:
+        assert m.absmax.dtype == torch.float32 and m.code.dtype == torch.float32
+        assert m.absmax.device.type == device
+    assert model(torch.randn(2, 64, device=device, dtype=dtype)).dtype == dtype
